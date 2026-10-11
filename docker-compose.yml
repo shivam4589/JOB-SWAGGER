@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: jobqueue
+      POSTGRES_USER: jobqueue
+      POSTGRES_PASSWORD: jobqueue
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobqueue -d jobqueue"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/jobqueue
+      DB_USER: jobqueue
+      DB_PASSWORD: jobqueue
+    ports:
+      - "8081:8080"
+
+  # Same image, worker mode. Scale it: docker compose up -d --scale worker=3
+  worker:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/jobqueue
+      DB_USER: jobqueue
+      DB_PASSWORD: jobqueue
+      JOBQUEUE_WORKER_ENABLED: "true"
+      JOBQUEUE_WORKER_CONCURRENCY: "4"
+      # Short timeout so the crash-recovery demo is quick. In real use it must exceed your slowest job.
+      JOBQUEUE_WORKER_LOCK_TIMEOUT_SECONDS: "30"
+      JOBQUEUE_WORKER_REAPER_INTERVAL_MS: "5000"
+      SPRING_MAIN_WEB_APPLICATION_TYPE: none
+
+volumes:
+  pgdata:
