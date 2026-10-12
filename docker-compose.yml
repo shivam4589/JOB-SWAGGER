@@ -43,6 +43,8 @@ services:
       JOBQUEUE_WORKER_LOCK_TIMEOUT_SECONDS: "30"
       JOBQUEUE_WORKER_REAPER_INTERVAL_MS: "5000"
       SPRING_MAIN_WEB_APPLICATION_TYPE: none
+      # 4 worker threads + reaper need few connections; keeps 6+ containers under Postgres' 100-connection limit
+      SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE: "6"
 
 volumes:
   pgdata:
