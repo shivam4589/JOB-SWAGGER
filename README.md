@@ -16,6 +16,20 @@ docker compose up --build
 - Swagger UI: http://localhost:8081/swagger-ui.html
 - Health: http://localhost:8081/actuator/health
 
+## Frontend
+
+The React dashboard is in `frontend/`. Start the API and database with Docker Compose, then run the frontend in a separate terminal:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open the URL printed by Vite (usually http://localhost:5173). The dashboard proxies API requests to `http://localhost:8081`, refreshes job data every five seconds, and supports submitting jobs and viewing their attempts.
+
+To create a production bundle, run `npm run build` from `frontend/`; the output is written to `frontend/dist/`.
+
 ## Try it
 
 ```bash
