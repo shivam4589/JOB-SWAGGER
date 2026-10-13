@@ -8,6 +8,7 @@ import java.net.URI;
 import java.util.List;
 import java.util.UUID;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -42,9 +43,27 @@ public class JobController {
         return service.attempts(id);
     }
 
+    /** Cancel a PENDING job. 404 if unknown, 409 if it is no longer PENDING. */
+    @DeleteMapping("/{id}")
+    public Job cancel(@PathVariable UUID id) {
+        return service.cancel(id);
+    }
+
+    /** Re-queue a DEAD job. 404 if unknown, 409 if it is not DEAD. */
+    @PostMapping("/{id}/retry")
+    public Job retry(@PathVariable UUID id) {
+        return service.retry(id);
+    }
+
+    /** The body stays a plain array; the total number of matches is in the X-Total-Count header. */
     @GetMapping
-    public List<Job> list(@RequestParam(required = false) JobStatus status,
-                          @RequestParam(defaultValue = "50") int limit) {
-        return service.list(status, limit);
+    public ResponseEntity<List<Job>> list(@RequestParam(required = false) JobStatus status,
+                                          @RequestParam(required = false) String type,
+                                          @RequestParam(defaultValue = "50") int limit,
+                                          @RequestParam(defaultValue = "0") int offset) {
+        JobService.PagedJobs page = service.list(status, type, limit, offset);
+        return ResponseEntity.ok()
+                .header("X-Total-Count", String.valueOf(page.total()))
+                .body(page.items());
     }
 }

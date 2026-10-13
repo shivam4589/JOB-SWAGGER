@@ -10,7 +10,9 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -198,6 +200,103 @@ public class JobRepository {
                 """)
                 .param("timeout", lockTimeoutSeconds)
                 .update();
+    }
+
+    // ------------------------------------------------------ dashboard / admin side
+
+    public record RecentStats(long succeededLastMinute, Double oldestDuePendingSeconds) {
+    }
+
+    public List<Job> list(JobStatus status, String type, int limit, int offset) {
+        Map<String, Object> params = new LinkedHashMap<>();
+        String where = buildWhere(status, type, params);
+        return jdbc.sql("SELECT * FROM jobs" + where
+                        + " ORDER BY created_at DESC, id LIMIT :limit OFFSET :offset")
+                .params(params)
+                .param("limit", limit)
+                .param("offset", offset)
+                .query(this::map)
+                .list();
+    }
+
+    public long count(JobStatus status, String type) {
+        Map<String, Object> params = new LinkedHashMap<>();
+        String where = buildWhere(status, type, params);
+        return jdbc.sql("SELECT count(*) FROM jobs" + where)
+                .params(params)
+                .query(Long.class)
+                .single();
+    }
+
+    // only constant SQL fragments are appended here; every value goes through a bind parameter
+    private static String buildWhere(JobStatus status, String type, Map<String, Object> params) {
+        StringBuilder where = new StringBuilder(" WHERE 1 = 1");
+        if (status != null) {
+            where.append(" AND status = :status");
+            params.put("status", status.name());
+        }
+        if (type != null && !type.isBlank()) {
+            where.append(" AND type = :type");
+            params.put("type", type);
+        }
+        return where.toString();
+    }
+
+    /**
+     * Cancels a job only while it is still PENDING. If a worker claims it at the same moment,
+     * the row lock makes this UPDATE re-check the status and match nothing (the caller gets a 409).
+     */
+    public Optional<Job> cancelIfPending(UUID id) {
+        return jdbc.sql("""
+                UPDATE jobs SET status = 'CANCELLED', updated_at = now()
+                WHERE id = :id AND status = 'PENDING'
+                RETURNING *
+                """)
+                .param("id", id)
+                .query(this::map)
+                .optional();
+    }
+
+    /** DEAD (or legacy FAILED) job back to PENDING with a fresh attempt budget; history stays in job_attempts. */
+    public Optional<Job> requeueIfDead(UUID id) {
+        return jdbc.sql("""
+                UPDATE jobs SET status = 'PENDING', attempts = 0, run_at = now(),
+                    locked_by = NULL, locked_at = NULL, updated_at = now()
+                WHERE id = :id AND status IN ('DEAD', 'FAILED')
+                RETURNING *
+                """)
+                .param("id", id)
+                .query(this::map)
+                .optional();
+    }
+
+    /** Job count per status, with 0 for statuses that currently have no jobs. */
+    public Map<String, Long> statusCounts() {
+        Map<String, Long> counts = new LinkedHashMap<>();
+        for (JobStatus s : JobStatus.values()) {
+            counts.put(s.name(), 0L);
+        }
+        jdbc.sql("SELECT status, count(*) AS n FROM jobs GROUP BY status")
+                .query((rs, i) -> Map.entry(rs.getString("status"), rs.getLong("n")))
+                .list()
+                .forEach(e -> counts.put(e.getKey(), e.getValue()));
+        return counts;
+    }
+
+    public RecentStats recentStats() {
+        return jdbc.sql("""
+                SELECT count(*) FILTER (WHERE status = 'SUCCEEDED'
+                                          AND updated_at > now() - INTERVAL '1 minute') AS succeeded_last_minute,
+                       EXTRACT(EPOCH FROM (now() - min(run_at)
+                                 FILTER (WHERE status = 'PENDING' AND run_at <= now()))) AS oldest_due_pending_seconds
+                FROM jobs
+                """)
+                .query((rs, i) -> {
+                    double oldest = rs.getDouble("oldest_due_pending_seconds");
+                    return new RecentStats(rs.getLong("succeeded_last_minute"),
+                            rs.wasNull() ? null : oldest);
+                })
+                .single();
     }
 
     // ------------------------------------------------------------------- mapping
