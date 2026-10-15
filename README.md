@@ -104,6 +104,42 @@ mvn test        # uses Testcontainers, Docker must be running
 - [x] Phase 1: schema, REST API, Docker Compose
 - [x] Phase 2: worker + SKIP LOCKED claiming
 - [x] Phase 3: retries, backoff, dead letters, stuck-job reaper
-- [ ] Phase 4: cancellation, delayed/recurring jobs
-- [ ] Phase 5: metrics
-- [x] Phase 6: CI (GitHub Actions) and load-test script
+- [x] Phase 4: cancel, retry, stats, filtering and paging, CORS, dashboard frontend
+- [x] CI (GitHub Actions) and load-test script
+- [ ] Phase 5: recurring (cron) jobs, idempotency keys
+- [ ] Phase 6: metrics (Prometheus / Grafana)
+
+
+## Benchmark results
+
+All services (PostgreSQL 16, API, workers) ran on one laptop in Docker Desktop with 4 CPUs and about 3.7 GB RAM, so treat these as relative numbers, not absolute capacity. Each worker container runs 4 polling threads. Reproduce with `loadtest/run-loadtest.ps1`.
+
+**Queue overhead** (`NOOP` jobs, 5,000 per run):
+
+| Workers | Threads | Jobs | Seconds | Jobs/sec | Duplicate attempts | Failed |
+|---|---|---|---|---|---|---|
+| 1 | 4 | 5000 | 15.74 | 317.7 | 0 | 0 |
+| 3 | 12 | 5000 | 10.25 | 487.6 | 0 | 0 |
+| 6 | 24 | 5000 | 27.56 | 181.4 | 0 | 0 |
+
+**Scaling with real work** (`SEND_EMAIL`, about 300 ms simulated work per job, 1,000 per run):
+
+| Workers | Threads | Jobs | Seconds | Jobs/sec | Duplicate attempts | Failed |
+|---|---|---|---|---|---|---|
+| 1 | 4 | 1000 | 82.46 | 12.1 | 0 | 0 |
+| 2 | 8 | 1000 | 45.94 | 21.8 | 0 | 0 |
+| 4 | 16 | 1000 | 30.07 | 33.3 | 0 | 0 |
+
+What the numbers show:
+- **Correctness under load:** no job was executed twice across 18,000 job runs, with up to 24 threads claiming jobs at the same time.
+- **Queue overhead:** one container processes about 320 no-op jobs/sec and three reach about 490. At six containers throughput drops, most likely because seven JVMs plus Postgres compete for 4 CPUs. That reflects the test machine, not the design.
+- **Scaling:** with I/O-bound jobs, throughput grows from 12.1 to 33.3 jobs/sec (2.75x) going from 1 to 4 containers. Each added container helps a bit less because all of them share the same CPUs and database.
+
+## Dashboard
+
+A React + Vite dashboard lives in `frontend/`. It shows live queue stats, a paged and filterable job list, per-job attempt history, and Cancel / Retry buttons.
+
+    cd frontend
+    npm install
+    npm run dev    # http://localhost:5173, proxies /api to localhost:8081
+
