@@ -292,9 +292,10 @@ public class JobRepository {
                 FROM jobs
                 """)
                 .query((rs, i) -> {
+                    long succeeded = rs.getLong("succeeded_last_minute");
                     double oldest = rs.getDouble("oldest_due_pending_seconds");
-                    return new RecentStats(rs.getLong("succeeded_last_minute"),
-                            rs.wasNull() ? null : oldest);
+                    boolean nothingWaiting = rs.wasNull(); // wasNull() only refers to the column read just before it
+                    return new RecentStats(succeeded, nothingWaiting ? null : oldest);
                 })
                 .single();
     }

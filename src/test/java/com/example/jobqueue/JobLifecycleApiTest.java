@@ -115,6 +115,14 @@ class JobLifecycleApiTest {
     }
 
     @Test
+    void statsReportNoWaitWhenNothingIsPending() throws Exception {
+        mvc.perform(get("/api/stats"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.total").value(0))
+                .andExpect(jsonPath("$.oldestDuePendingSeconds").doesNotExist());
+    }
+
+    @Test
     void listSupportsTypeFilterAndPaging() throws Exception {
         submit("A");
         submit("A");
