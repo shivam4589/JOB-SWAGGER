@@ -1,32 +1,51 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import './actions.css'
 
-const STATUSES = ['PENDING', 'RUNNING', 'SUCCEEDED', 'DEAD', 'FAILED', 'CANCELLED']
+const DASH = '\u2014'
+const PAGE_SIZE = 25
+const STATUSES = ['PENDING', 'RUNNING', 'SUCCEEDED', 'DEAD', 'CANCELLED']
+
+async function errorMessage(response) {
+  let message = `Request failed (${response.status})`
+  try {
+    const body = await response.json()
+    if (body.errors) {
+      const details = Object.entries(body.errors).map(([field, text]) => `${field}: ${text}`).join('; ')
+      message = details ? `${body.detail || 'Validation failed'} - ${details}` : message
+    } else {
+      message = body.detail || body.message || body.error || message
+    }
+  } catch {
+    // Keep the HTTP status message when the response is not JSON.
+  }
+  return message
+}
 
 async function request(url, options) {
   const response = await fetch(url, options)
-  if (!response.ok) {
-    let message = `Request failed (${response.status})`
-    try {
-      const body = await response.json()
-      message = body.message || body.error || message
-    } catch {
-      // Keep the HTTP status message when the response is not JSON.
-    }
-    throw new Error(message)
-  }
+  if (!response.ok) throw new Error(await errorMessage(response))
   return response.json()
 }
 
+// Job lists come back as a plain array; the total number of matches is in the X-Total-Count header.
+async function requestPage(url) {
+  const response = await fetch(url)
+  if (!response.ok) throw new Error(await errorMessage(response))
+  const items = await response.json()
+  const header = response.headers.get('X-Total-Count')
+  return { items, total: header === null ? items.length : Number(header) }
+}
+
 function formatDate(value) {
-  if (!value) return '—'
+  if (!value) return DASH
   const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString()
+  return Number.isNaN(date.getTime()) ? DASH : date.toLocaleString()
 }
 
 function relativeTime(value) {
-  if (!value) return '—'
+  if (!value) return DASH
   const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return '—'
+  if (Number.isNaN(date.getTime())) return DASH
   const seconds = Math.round((date.getTime() - Date.now()) / 1000)
   const formatter = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' })
   if (Math.abs(seconds) < 60) return formatter.format(seconds, 'second')
@@ -35,8 +54,15 @@ function relativeTime(value) {
   return formatter.format(Math.round(seconds / 86400), 'day')
 }
 
+function formatWait(seconds) {
+  if (seconds === null || seconds === undefined) return 'nothing waiting'
+  if (seconds < 60) return `${Math.max(0, Math.round(seconds))}s`
+  if (seconds < 3600) return `${Math.round(seconds / 60)} min`
+  return `${(seconds / 3600).toFixed(1)} h`
+}
+
 function shortId(id) {
-  return id ? id.slice(0, 8) : '—'
+  return id ? id.slice(0, 8) : DASH
 }
 
 function StatusBadge({ status }) {
@@ -63,6 +89,7 @@ function Icon({ name, size = 18 }) {
     refresh: <><path d="M20 7v5h-5" /><path d="M4.9 9a7.5 7.5 0 0 1 12.7-2L20 12" /><path d="M4 17v-5h5" /><path d="M19.1 15a7.5 7.5 0 0 1-12.7 2L4 12" /></>,
     close: <><path d="m18 6-12 12" /><path d="m6 6 12 12" /></>,
     chevron: <path d="m9 18 6-6-6-6" />,
+    chevronDown: <path d="m6 9 6 6 6-6" />,
     clock: <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>,
     check: <><path d="m5 12 4 4L19 6" /></>,
     activity: <><path d="M3 12h4l3-8 4 16 3-8h4" /></>,
@@ -78,16 +105,16 @@ function MetricCard({ label, count, icon, tone, loading }) {
       <div className={`metric-icon ${tone}`}><Icon name={icon} size={19} /></div>
       <div className="metric-copy">
         <span>{label}</span>
-        <strong>{loading ? '—' : count}</strong>
+        <strong>{loading ? DASH : count}</strong>
       </div>
-      <span className="metric-caption">recent jobs</span>
+      <span className="metric-caption">all jobs</span>
     </div>
   )
 }
 
 function JobTable({ jobs, loading, onSelect, onClear }) {
   if (loading && jobs.length === 0) {
-    return <div className="table-message"><span className="spinner" /> Loading jobs…</div>
+    return <div className="table-message"><span className="spinner" /> Loading jobs...</div>
   }
   if (!loading && jobs.length === 0) {
     return (
@@ -124,8 +151,8 @@ function JobTable({ jobs, loading, onSelect, onClear }) {
                 </div>
               </td>
               <td><StatusBadge status={job.status} /></td>
-              <td><span className="priority"><span className={`priority-dot priority-${job.priority >= 8 ? 'high' : job.priority >= 5 ? 'normal' : 'low'}`} />{job.priority ?? '—'}</span></td>
-              <td><span className="attempt-count">{job.attempts ?? 0}<span> / {job.maxAttempts ?? '—'}</span></span></td>
+              <td><span className="priority"><span className={`priority-dot priority-${job.priority >= 8 ? 'high' : job.priority >= 5 ? 'normal' : 'low'}`} />{job.priority ?? DASH}</span></td>
+              <td><span className="attempt-count">{job.attempts ?? 0}<span> / {job.maxAttempts ?? DASH}</span></span></td>
               <td><span className="created-time">{relativeTime(job.createdAt)}</span></td>
               <td><button className="row-open" aria-label={`View job ${shortId(job.id)}`}><Icon name="chevron" size={17} /></button></td>
             </tr>
@@ -197,7 +224,7 @@ function SubmitModal({ onClose, onSubmitted }) {
           <div><span className="eyebrow">QUEUE ACTION</span><h2 id="submit-title">Create a job</h2></div>
           <button className="icon-button" onClick={onClose} aria-label="Close dialog"><Icon name="close" /></button>
         </div>
-        <p className="modal-intro">Add a task to the queue. Your worker will pick it up when it’s ready.</p>
+        <p className="modal-intro">Add a task to the queue. Your worker will pick it up when it's ready.</p>
         <form onSubmit={submit}>
           <label className="field-label" htmlFor="job-type">Job type</label>
           <input id="job-type" className="input-control" value={type} onChange={(event) => setType(event.target.value)} required maxLength={100} placeholder="e.g. SEND_EMAIL" />
@@ -211,8 +238,8 @@ function SubmitModal({ onClose, onSubmitted }) {
           <textarea id="job-payload" className="input-control code-input" value={payload} onChange={(event) => setPayload(event.target.value)} rows={5} spellCheck={false} />
 
           <div className="form-grid">
-            <div><label className="field-label" htmlFor="job-priority">Priority <span>1–10</span></label><input id="job-priority" className="input-control" type="number" min="1" max="10" value={priority} onChange={(event) => setPriority(event.target.value)} required /></div>
-            <div><label className="field-label" htmlFor="job-max-attempts">Max attempts <span>1–20</span></label><input id="job-max-attempts" className="input-control" type="number" min="1" max="20" value={maxAttempts} onChange={(event) => setMaxAttempts(event.target.value)} required /></div>
+            <div><label className="field-label" htmlFor="job-priority">Priority <span>1-10</span></label><input id="job-priority" className="input-control" type="number" min="1" max="10" value={priority} onChange={(event) => setPriority(event.target.value)} required /></div>
+            <div><label className="field-label" htmlFor="job-max-attempts">Max attempts <span>1-20</span></label><input id="job-max-attempts" className="input-control" type="number" min="1" max="20" value={maxAttempts} onChange={(event) => setMaxAttempts(event.target.value)} required /></div>
           </div>
           <label className="field-label delay-label" htmlFor="job-delay">Delay <span>seconds before the job can run</span></label>
           <input id="job-delay" className="input-control" type="number" min="0" value={delaySeconds} onChange={(event) => setDelaySeconds(event.target.value)} required />
@@ -220,7 +247,7 @@ function SubmitModal({ onClose, onSubmitted }) {
           {error && <div className="form-error" role="alert"><Icon name="alert" size={16} />{error}</div>}
           <div className="modal-actions">
             <button type="button" className="button button-secondary" onClick={onClose}>Cancel</button>
-            <button type="submit" className="button button-primary" disabled={submitting}>{submitting ? <><span className="spinner spinner-white" />Adding job…</> : <><Icon name="plus" size={17} />Add to queue</>}</button>
+            <button type="submit" className="button button-primary" disabled={submitting}>{submitting ? <><span className="spinner spinner-white" />Adding job...</> : <><Icon name="plus" size={17} />Add to queue</>}</button>
           </div>
         </form>
       </section>
@@ -228,7 +255,9 @@ function SubmitModal({ onClose, onSubmitted }) {
   )
 }
 
-function JobDrawer({ job, attempts, attemptsLoading, attemptsError, onClose }) {
+function JobDrawer({ job, attempts, attemptsLoading, attemptsError, actionBusy, actionError, onCancel, onRetry, onClose }) {
+  const canCancel = job.status === 'PENDING'
+  const canRetry = job.status === 'DEAD' || job.status === 'FAILED'
   return (
     <div className="drawer-backdrop" onMouseDown={(event) => {
       if (event.target === event.currentTarget) onClose()
@@ -239,10 +268,17 @@ function JobDrawer({ job, attempts, attemptsLoading, attemptsError, onClose }) {
           <button className="icon-button" onClick={onClose} aria-label="Close job details"><Icon name="close" /></button>
         </div>
         <div className="drawer-summary"><StatusBadge status={job.status} /><span>#{job.id}</span></div>
+        {(canCancel || canRetry) && (
+          <div className="drawer-actions">
+            {canCancel && <button className="button button-danger" onClick={onCancel} disabled={actionBusy}>Cancel job</button>}
+            {canRetry && <button className="button button-primary" onClick={onRetry} disabled={actionBusy}><Icon name="refresh" size={16} />Retry job</button>}
+          </div>
+        )}
+        {actionError && <div className="form-error" role="alert"><Icon name="alert" size={16} />{actionError}</div>}
         {job.lastError && <div className="last-error"><Icon name="alert" size={17} /><div><strong>Last error</strong><p>{job.lastError}</p></div></div>}
         <div className="detail-grid">
-          <div><span>Priority</span><strong>{job.priority ?? '—'}</strong></div>
-          <div><span>Attempts</span><strong>{job.attempts ?? 0} / {job.maxAttempts ?? '—'}</strong></div>
+          <div><span>Priority</span><strong>{job.priority ?? DASH}</strong></div>
+          <div><span>Attempts</span><strong>{job.attempts ?? 0} / {job.maxAttempts ?? DASH}</strong></div>
           <div><span>Created</span><strong>{formatDate(job.createdAt)}</strong></div>
           <div><span>Updated</span><strong>{formatDate(job.updatedAt)}</strong></div>
           <div><span>Scheduled</span><strong>{formatDate(job.runAt)}</strong></div>
@@ -252,15 +288,15 @@ function JobDrawer({ job, attempts, attemptsLoading, attemptsError, onClose }) {
           <pre className="json-block">{JSON.stringify(job.payload, null, 2) ?? 'null'}</pre>
         </div>
         <div className="drawer-section attempts-section">
-          <div className="section-title"><h3>Attempts</h3><span>{attemptsLoading ? 'Loading…' : attempts.length}</span></div>
+          <div className="section-title"><h3>Attempts</h3><span>{attemptsLoading ? 'Loading...' : attempts.length}</span></div>
           {attemptsError && <div className="inline-error" role="alert">{attemptsError}</div>}
-          {!attemptsLoading && !attemptsError && attempts.length === 0 && <p className="no-attempts">This job hasn’t been picked up by a worker yet.</p>}
+          {!attemptsLoading && !attemptsError && attempts.length === 0 && <p className="no-attempts">This job hasn't been picked up by a worker yet.</p>}
           {attempts.map((attempt) => (
             <div className="attempt-row" key={attempt.id}>
               <span className={`attempt-icon ${attempt.success === true ? 'attempt-success' : attempt.success === false ? 'attempt-failure' : 'attempt-running'}`}><Icon name={attempt.success === true ? 'check' : attempt.success === false ? 'close' : 'clock'} size={15} /></span>
               <div className="attempt-info">
                 <div><strong>Attempt {attempt.id}</strong><span>{attempt.success === true ? 'Succeeded' : attempt.success === false ? 'Failed' : 'Running'}</span></div>
-                <small>{attempt.workerId || 'Worker'} · {formatDate(attempt.startedAt)}</small>
+                <small>{attempt.workerId || 'Worker'} - {formatDate(attempt.startedAt)}</small>
                 {attempt.error && <p>{attempt.error}</p>}
               </div>
             </div>
@@ -273,6 +309,9 @@ function JobDrawer({ job, attempts, attemptsLoading, attemptsError, onClose }) {
 
 export default function App() {
   const [jobs, setJobs] = useState([])
+  const [total, setTotal] = useState(0)
+  const [stats, setStats] = useState(null)
+  const [page, setPage] = useState(0)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [filter, setFilter] = useState('ALL')
@@ -283,12 +322,28 @@ export default function App() {
   const [attempts, setAttempts] = useState([])
   const [attemptsLoading, setAttemptsLoading] = useState(false)
   const [attemptsError, setAttemptsError] = useState('')
+  const [actionBusy, setActionBusy] = useState(false)
+  const [actionError, setActionError] = useState('')
+  const selectedId = selectedJob ? selectedJob.id : null
 
-  const loadJobs = useCallback(async (initial = false) => {
+  // One refresh loads the current page of jobs (filtered by status on the server) and the overall stats.
+  const refresh = useCallback(async (initial = false) => {
     if (initial) setLoading(true)
     try {
-      const result = await request('/api/jobs?limit=200')
-      setJobs(result)
+      const params = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(page * PAGE_SIZE) })
+      if (filter !== 'ALL') params.set('status', filter)
+      const [list, statsResult] = await Promise.all([
+        requestPage(`/api/jobs?${params.toString()}`),
+        request('/api/stats'),
+      ])
+      const lastPage = Math.max(0, Math.ceil(list.total / PAGE_SIZE) - 1)
+      if (page > lastPage) {
+        setPage(lastPage)
+        return
+      }
+      setJobs(list.items)
+      setTotal(list.total)
+      setStats(statsResult)
       setError('')
       setLastUpdated(new Date())
     } catch (loadError) {
@@ -296,54 +351,107 @@ export default function App() {
     } finally {
       if (initial) setLoading(false)
     }
-  }, [])
+  }, [page, filter])
 
   useEffect(() => {
-    loadJobs(true)
-    const interval = window.setInterval(() => loadJobs(), 5000)
+    refresh(true)
+    const interval = window.setInterval(() => refresh(), 5000)
     return () => window.clearInterval(interval)
-  }, [loadJobs])
+  }, [refresh])
 
-  const counts = useMemo(() => ({
-    total: jobs.length,
-    pending: jobs.filter((job) => job.status === 'PENDING').length,
-    running: jobs.filter((job) => job.status === 'RUNNING').length,
-    succeeded: jobs.filter((job) => job.status === 'SUCCEEDED').length,
-    dead: jobs.filter((job) => job.status === 'DEAD' || job.status === 'FAILED').length,
-  }), [jobs])
+  // While the drawer is open, keep the selected job and its attempts live.
+  useEffect(() => {
+    if (!selectedId) return undefined
+    let cancelled = false
+    async function refreshSelected(first) {
+      if (first) {
+        setAttemptsLoading(true)
+        setAttemptsError('')
+      }
+      try {
+        const [job, attemptList] = await Promise.all([
+          request(`/api/jobs/${selectedId}`),
+          request(`/api/jobs/${selectedId}/attempts`),
+        ])
+        if (cancelled) return
+        setSelectedJob(job)
+        setAttempts(attemptList)
+        setAttemptsError('')
+      } catch (loadError) {
+        if (!cancelled) setAttemptsError(loadError.message)
+      } finally {
+        if (first && !cancelled) setAttemptsLoading(false)
+      }
+    }
+    refreshSelected(true)
+    const interval = window.setInterval(() => refreshSelected(false), 4000)
+    return () => {
+      cancelled = true
+      window.clearInterval(interval)
+    }
+  }, [selectedId])
 
+  const byStatus = stats ? stats.byStatus : {}
+  const counts = {
+    total: stats ? stats.total : 0,
+    pending: byStatus.PENDING ?? 0,
+    running: byStatus.RUNNING ?? 0,
+    succeeded: byStatus.SUCCEEDED ?? 0,
+    dead: (byStatus.DEAD ?? 0) + (byStatus.FAILED ?? 0),
+  }
+  const statsLoading = loading && !stats
+
+  // The search box filters the jobs on the current page only; the status filter and paging run on the server.
   const visibleJobs = useMemo(() => {
     const query = search.trim().toLowerCase()
-    return jobs.filter((job) => {
-      const statusMatches = filter === 'ALL' || job.status === filter
-      const searchMatches = !query || `${job.type} ${job.id} ${job.status}`.toLowerCase().includes(query)
-      return statusMatches && searchMatches
-    })
-  }, [jobs, filter, search])
+    if (!query) return jobs
+    return jobs.filter((job) => `${job.type} ${job.id} ${job.status}`.toLowerCase().includes(query))
+  }, [jobs, search])
 
-  async function openJob(job) {
-    setSelectedJob(job)
+  const firstShown = total === 0 ? 0 : page * PAGE_SIZE + 1
+  const lastShown = page * PAGE_SIZE + jobs.length
+
+  function openJob(job) {
     setAttempts([])
     setAttemptsError('')
-    setAttemptsLoading(true)
-    try {
-      setAttempts(await request(`/api/jobs/${job.id}/attempts`))
-    } catch (loadError) {
-      setAttemptsError(loadError.message)
-    } finally {
-      setAttemptsLoading(false)
-    }
+    setActionError('')
+    setSelectedJob(job)
   }
 
   function handleSubmitted(job) {
     setSubmitting(false)
-    setSelectedJob(job)
-    loadJobs()
+    setPage(0)
+    openJob(job)
+    refresh()
+  }
+
+  function changeFilter(value) {
+    setFilter(value)
+    setPage(0)
   }
 
   function clearFilters() {
     setFilter('ALL')
     setSearch('')
+    setPage(0)
+  }
+
+  async function runAction(kind) {
+    if (!selectedJob) return
+    if (kind === 'cancel' && !window.confirm('Cancel this job? It will not run.')) return
+    setActionBusy(true)
+    setActionError('')
+    try {
+      const updated = kind === 'cancel'
+        ? await request(`/api/jobs/${selectedJob.id}`, { method: 'DELETE' })
+        : await request(`/api/jobs/${selectedJob.id}/retry`, { method: 'POST' })
+      setSelectedJob(updated)
+    } catch (actionFailure) {
+      setActionError(actionFailure.message)
+    } finally {
+      setActionBusy(false)
+      refresh()
+    }
   }
 
   return (
@@ -356,7 +464,7 @@ export default function App() {
         <div className="workspace-switcher">
           <span className="workspace-icon">JQ</span>
           <span className="workspace-copy"><strong>Job Queue</strong><small>Workspace</small></span>
-          <span className="workspace-chevron">⌄</span>
+          <span className="workspace-chevron"><Icon name="chevronDown" size={16} /></span>
         </div>
         <div className="nav-label">WORKSPACE</div>
         <nav className="side-nav" aria-label="Main navigation">
@@ -364,15 +472,15 @@ export default function App() {
           <button className="nav-item" onClick={() => document.getElementById('jobs-section')?.scrollIntoView({ behavior: 'smooth' })}><Icon name="layers" size={18} />Jobs<span className="nav-count">{counts.total}</span></button>
         </nav>
         <div className="sidebar-bottom">
-          <div className="api-status"><span className={`connection-dot ${error ? 'offline' : ''}`} /><span><strong>{loading ? 'Connecting…' : error ? 'API unavailable' : 'API connected'}</strong><small>{error ? 'Check your connection' : 'localhost:8081'}</small></span></div>
-          <div className="user-card"><span className="avatar">JD</span><span><strong>Job Dashboard</strong><small>Local environment</small></span><span className="user-menu">···</span></div>
+          <div className="api-status"><span className={`connection-dot ${error ? 'offline' : ''}`} /><span><strong>{loading ? 'Connecting...' : error ? 'API unavailable' : 'API connected'}</strong><small>{error ? 'Check your connection' : 'localhost:8081'}</small></span></div>
+          <div className="user-card"><span className="avatar">JD</span><span><strong>Job Dashboard</strong><small>Local environment</small></span><span className="user-menu">...</span></div>
         </div>
       </aside>
 
       <main className="main-content">
         <header className="topbar">
           <div className="breadcrumbs"><span>Job Queue</span><Icon name="chevron" size={14} /><strong>Overview</strong></div>
-          <div className="topbar-right"><span className="live-indicator"><span />Live updates</span><button className="icon-button refresh-button" onClick={() => loadJobs()} aria-label="Refresh jobs"><Icon name="refresh" /></button></div>
+          <div className="topbar-right"><span className="live-indicator"><span />Live updates</span><button className="icon-button refresh-button" onClick={() => refresh()} aria-label="Refresh jobs"><Icon name="refresh" /></button></div>
         </header>
 
         <div className="page-content">
@@ -381,34 +489,49 @@ export default function App() {
             <button className="button button-primary new-job-button" onClick={() => setSubmitting(true)}><Icon name="plus" size={18} />Create job</button>
           </section>
 
-          {error && <div className="connection-error" role="alert"><Icon name="alert" size={19} /><div><strong>Couldn’t load jobs</strong><span>{error} · Check that the API is running on port 8081.</span></div><button className="text-button" onClick={() => loadJobs(true)}>Try again</button></div>}
+          {error && <div className="connection-error" role="alert"><Icon name="alert" size={19} /><div><strong>Couldn't load jobs</strong><span>{error} - Check that the API is running on port 8081.</span></div><button className="text-button" onClick={() => refresh(true)}>Try again</button></div>}
 
           <section className="metrics-grid" aria-label="Job metrics">
-            <MetricCard label="Total jobs" count={counts.total} icon="layers" tone="metric-purple" loading={loading} />
-            <MetricCard label="Pending" count={counts.pending} icon="clock" tone="metric-amber" loading={loading} />
-            <MetricCard label="Running" count={counts.running} icon="activity" tone="metric-blue" loading={loading} />
-            <MetricCard label="Succeeded" count={counts.succeeded} icon="check" tone="metric-green" loading={loading} />
-            <MetricCard label="Dead letters" count={counts.dead} icon="alert" tone="metric-red" loading={loading} />
+            <MetricCard label="Total jobs" count={counts.total} icon="layers" tone="metric-purple" loading={statsLoading} />
+            <MetricCard label="Pending" count={counts.pending} icon="clock" tone="metric-amber" loading={statsLoading} />
+            <MetricCard label="Running" count={counts.running} icon="activity" tone="metric-blue" loading={statsLoading} />
+            <MetricCard label="Succeeded" count={counts.succeeded} icon="check" tone="metric-green" loading={statsLoading} />
+            <MetricCard label="Dead letters" count={counts.dead} icon="alert" tone="metric-red" loading={statsLoading} />
           </section>
+
+          {stats && (
+            <div className="stats-strip">
+              <span className="stat-item"><span className="stat-dot" />Finished in the last minute: <strong>{stats.succeededLastMinute}</strong></span>
+              <span className="stat-item"><span className="stat-dot amber" />Longest wait for a runnable job: <strong>{formatWait(stats.oldestDuePendingSeconds)}</strong></span>
+            </div>
+          )}
 
           <section className="jobs-panel" id="jobs-section">
             <div className="panel-heading">
-              <div><div className="panel-title"><h2>Recent jobs</h2><span className="result-count">{counts.total}</span></div><p>Latest activity across your queue <span>· Up to 200 jobs</span></p></div>
+              <div><div className="panel-title"><h2>Jobs</h2><span className="result-count">{total}</span></div><p>Newest first <span>- {PAGE_SIZE} per page</span></p></div>
               <span className="updated-time">{lastUpdated ? `Updated ${relativeTime(lastUpdated)}` : 'Waiting for data'}</span>
             </div>
             <div className="table-toolbar">
-              <label className="search-field"><Icon name="search" size={17} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search jobs…" aria-label="Search jobs" />{search && <button onClick={() => setSearch('')} aria-label="Clear search"><Icon name="close" size={14} /></button>}</label>
-              <label className="filter-field"><Icon name="sliders" size={16} /><select value={filter} onChange={(event) => setFilter(event.target.value)} aria-label="Filter by status"><option value="ALL">All statuses</option>{STATUSES.map((status) => <option key={status} value={status}>{status.replace('_', ' ')}</option>)}</select></label>
+              <label className="search-field"><Icon name="search" size={17} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search this page..." aria-label="Search jobs on this page" />{search && <button onClick={() => setSearch('')} aria-label="Clear search"><Icon name="close" size={14} /></button>}</label>
+              <label className="filter-field"><Icon name="sliders" size={16} /><select value={filter} onChange={(event) => changeFilter(event.target.value)} aria-label="Filter by status"><option value="ALL">All statuses</option>{STATUSES.map((status) => <option key={status} value={status}>{status}</option>)}</select></label>
             </div>
             <JobTable jobs={visibleJobs} loading={loading} onSelect={openJob} onClear={clearFilters} />
-            <div className="table-footer"><span>Showing <strong>{visibleJobs.length}</strong> of <strong>{counts.total}</strong> recent jobs</span><span className="auto-refresh"><span />Auto-refreshes every 5 seconds</span></div>
+            <div className="table-footer">
+              <span>Showing <strong>{firstShown}-{lastShown}</strong> of <strong>{total}</strong> jobs</span>
+              <span className="pager">
+                <button className="button button-secondary button-small" onClick={() => setPage(page - 1)} disabled={page === 0}>Previous</button>
+                <span className="pager-page">Page {page + 1}</span>
+                <button className="button button-secondary button-small" onClick={() => setPage(page + 1)} disabled={(page + 1) * PAGE_SIZE >= total}>Next</button>
+              </span>
+              <span className="auto-refresh"><span />Auto-refreshes every 5 seconds</span>
+            </div>
           </section>
-          <footer className="page-footer"><span>Queueboard <span>·</span> Job Queue Console</span><span>{lastUpdated ? `Last synced ${formatDate(lastUpdated)}` : 'Connecting to API…'}</span></footer>
+          <footer className="page-footer"><span>Queueboard <span>|</span> Job Queue Console</span><span>{lastUpdated ? `Last synced ${formatDate(lastUpdated)}` : 'Connecting to API...'}</span></footer>
         </div>
       </main>
 
       {submitting && <SubmitModal onClose={() => setSubmitting(false)} onSubmitted={handleSubmitted} />}
-      {selectedJob && <JobDrawer job={selectedJob} attempts={attempts} attemptsLoading={attemptsLoading} attemptsError={attemptsError} onClose={() => setSelectedJob(null)} />}
+      {selectedJob && <JobDrawer job={selectedJob} attempts={attempts} attemptsLoading={attemptsLoading} attemptsError={attemptsError} actionBusy={actionBusy} actionError={actionError} onCancel={() => runAction('cancel')} onRetry={() => runAction('retry')} onClose={() => setSelectedJob(null)} />}
     </div>
   )
 }

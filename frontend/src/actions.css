@@ -1,0 +1,16 @@
+/* Additions for cancel/retry actions, the stats strip and paging. Loaded from App.jsx. */
+
+.stats-strip { display: flex; flex-wrap: wrap; gap: 8px 28px; margin: -8px 2px 24px; color: #85899a; font-size: 11px; }
+.stats-strip .stat-item { display: inline-flex; align-items: center; gap: 7px; }
+.stats-strip strong { color: #3d4054; font-weight: 600; }
+.stats-strip .stat-dot { width: 6px; height: 6px; border-radius: 50%; background: #39b980; }
+.stats-strip .stat-dot.amber { background: #d99932; }
+
+.drawer-actions { display: flex; gap: 8px; margin-top: 18px; }
+.button-danger { border-color: #f0cfcd; background: #fff; color: #c0504a; }
+.button-danger:hover { background: #fff5f4; }
+.button:disabled { cursor: wait; opacity: .7; }
+.button-small { min-height: 26px; padding: 0 10px; font-size: 10px; }
+
+.pager { display: flex; align-items: center; gap: 8px; }
+.pager-page { color: #8a8e9d; font-size: 9px; }
