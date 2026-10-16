@@ -49,6 +49,25 @@ public class JobRepository {
                 .single();
     }
 
+    /** Inserts a job created by a recurring schedule; it is due immediately. */
+    public Job insertForSchedule(UUID id, UUID scheduleId, String type, JsonNode payload,
+                                 int priority, int maxAttempts) {
+        return jdbc.sql("""
+                INSERT INTO jobs (id, type, payload, status, priority, run_at, max_attempts, schedule_id)
+                VALUES (:id, :type, CAST(:payload AS jsonb), 'PENDING', :priority, now(),
+                        :maxAttempts, :scheduleId)
+                RETURNING *
+                """)
+                .param("id", id)
+                .param("type", type)
+                .param("payload", payload.toString())
+                .param("priority", priority)
+                .param("maxAttempts", maxAttempts)
+                .param("scheduleId", scheduleId)
+                .query(this::map)
+                .single();
+    }
+
     public Optional<Job> findById(UUID id) {
         return jdbc.sql("SELECT * FROM jobs WHERE id = :id")
                 .param("id", id)
@@ -315,7 +334,8 @@ public class JobRepository {
                     rs.getInt("max_attempts"),
                     rs.getString("last_error"),
                     rs.getTimestamp("created_at").toInstant(),
-                    rs.getTimestamp("updated_at").toInstant());
+                    rs.getTimestamp("updated_at").toInstant(),
+                    rs.getObject("schedule_id", UUID.class));
         } catch (JsonProcessingException e) {
             throw new SQLException("Invalid JSON payload in database", e);
         }

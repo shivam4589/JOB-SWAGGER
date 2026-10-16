@@ -1,5 +1,7 @@
 package com.example.jobqueue.api;
 
+import com.example.jobqueue.schedule.InvalidScheduleException;
+import com.example.jobqueue.schedule.ScheduleNotFoundException;
 import java.util.Map;
 import java.util.stream.Collectors;
 import org.springframework.http.HttpStatus;
@@ -12,14 +14,19 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 @RestControllerAdvice
 public class GlobalExceptionHandler {
 
-    @ExceptionHandler(JobNotFoundException.class)
-    public ProblemDetail notFound(JobNotFoundException ex) {
+    @ExceptionHandler({JobNotFoundException.class, ScheduleNotFoundException.class})
+    public ProblemDetail notFound(RuntimeException ex) {
         return ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, ex.getMessage());
     }
 
     @ExceptionHandler(JobStateConflictException.class)
     public ProblemDetail conflict(JobStateConflictException ex) {
         return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, ex.getMessage());
+    }
+
+    @ExceptionHandler(InvalidScheduleException.class)
+    public ProblemDetail invalidSchedule(InvalidScheduleException ex) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, ex.getMessage());
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

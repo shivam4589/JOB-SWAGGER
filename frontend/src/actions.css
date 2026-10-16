@@ -1,4 +1,4 @@
-/* Additions for cancel/retry actions, the stats strip and paging. Loaded from App.jsx. */
+/* Additions for cancel/retry actions, the stats strip, paging and recurring schedules. Loaded from App.jsx. */
 
 .stats-strip { display: flex; flex-wrap: wrap; gap: 8px 28px; margin: -8px 2px 24px; color: #85899a; font-size: 11px; }
 .stats-strip .stat-item { display: inline-flex; align-items: center; gap: 7px; }
@@ -14,3 +14,12 @@
 
 .pager { display: flex; align-items: center; gap: 8px; }
 .pager-page { color: #8a8e9d; font-size: 9px; }
+
+/* recurring schedules */
+.status-active { background: #e8f7ef; color: #31956a; }
+.status-paused { background: #f0f1f4; color: #828694; }
+.cron-code { color: #4d5061; font-family: 'DM Mono', monospace; font-size: 10px; }
+.schedule-actions { display: inline-flex; gap: 6px; }
+.schedules-table tbody tr { cursor: default; }
+.schedules-table tbody tr:hover { background: #fbfaff; }
+.schedule-note { margin: 0 0 16px; border: 1px solid #e5e1f6; border-radius: 8px; background: #f8f6ff; padding: 10px 12px; color: #5e4cb3; font-size: 11px; }

@@ -15,5 +15,6 @@ public record Job(
         int maxAttempts,
         String lastError,
         Instant createdAt,
-        Instant updatedAt) {
+        Instant updatedAt,
+        UUID scheduleId) {
 }

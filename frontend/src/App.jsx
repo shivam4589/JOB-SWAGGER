@@ -4,6 +4,13 @@ import './actions.css'
 const DASH = '\u2014'
 const PAGE_SIZE = 25
 const STATUSES = ['PENDING', 'RUNNING', 'SUCCEEDED', 'DEAD', 'CANCELLED']
+const CRON_PRESETS = [
+  { label: 'Every minute', value: '* * * * *' },
+  { label: 'Every 5 minutes', value: '*/5 * * * *' },
+  { label: 'Hourly', value: '0 * * * *' },
+  { label: 'Daily 09:00', value: '0 9 * * *' },
+  { label: 'Weekdays 09:00', value: '0 9 * * 1-5' },
+]
 
 async function errorMessage(response) {
   let message = `Request failed (${response.status})`
@@ -34,6 +41,14 @@ async function requestPage(url) {
   const items = await response.json()
   const header = response.headers.get('X-Total-Count')
   return { items, total: header === null ? items.length : Number(header) }
+}
+
+function browserZone() {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
+  } catch {
+    return 'UTC'
+  }
 }
 
 function formatDate(value) {
@@ -91,6 +106,7 @@ function Icon({ name, size = 18 }) {
     chevron: <path d="m9 18 6-6-6-6" />,
     chevronDown: <path d="m6 9 6 6 6-6" />,
     clock: <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>,
+    calendar: <><rect x="3.5" y="5" width="17" height="15.5" rx="2" /><path d="M3.5 10h17" /><path d="M8 3v4" /><path d="M16 3v4" /></>,
     check: <><path d="m5 12 4 4L19 6" /></>,
     activity: <><path d="M3 12h4l3-8 4 16 3-8h4" /></>,
     alert: <><path d="M10.3 3.9 2.7 17a2 2 0 0 0 1.7 3h15.2a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" /><path d="M12 9v4" /><path d="M12 17h.01" /></>,
@@ -147,7 +163,7 @@ function JobTable({ jobs, loading, onSelect, onClear }) {
               <td>
                 <div className="job-cell">
                   <span className="job-type">{job.type}</span>
-                  <span className="job-id">#{shortId(job.id)}</span>
+                  <span className="job-id">#{shortId(job.id)}{job.scheduleId ? ' - scheduled' : ''}</span>
                 </div>
               </td>
               <td><StatusBadge status={job.status} /></td>
@@ -255,6 +271,177 @@ function SubmitModal({ onClose, onSubmitted }) {
   )
 }
 
+function ScheduleModal({ onClose, onCreated }) {
+  const [name, setName] = useState('')
+  const [type, setType] = useState('SEND_EMAIL')
+  const [cron, setCron] = useState('*/5 * * * *')
+  const [timezone, setTimezone] = useState(browserZone())
+  const [payload, setPayload] = useState('{\n  "to": "user@example.com"\n}')
+  const [priority, setPriority] = useState('5')
+  const [maxAttempts, setMaxAttempts] = useState('5')
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState('')
+
+  function changeType(value) {
+    setType(value)
+    if (value === 'SLOW') setPayload('{\n  "seconds": 20\n}')
+    else if (value === 'SEND_EMAIL') setPayload('{\n  "to": "user@example.com"\n}')
+    else setPayload('{}')
+  }
+
+  async function submit(event) {
+    event.preventDefault()
+    setError('')
+    let parsedPayload
+    try {
+      parsedPayload = JSON.parse(payload)
+    } catch {
+      setError('Payload must be valid JSON.')
+      return
+    }
+    if (parsedPayload === null) {
+      setError('Payload cannot be null.')
+      return
+    }
+
+    setSubmitting(true)
+    try {
+      const schedule = await request('/api/schedules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: name.trim(),
+          type: type.trim(),
+          payload: parsedPayload,
+          cron: cron.trim(),
+          timezone: timezone.trim() || 'UTC',
+          priority: Number(priority),
+          maxAttempts: Number(maxAttempts),
+        }),
+      })
+      onCreated(schedule)
+    } catch (submissionError) {
+      setError(submissionError.message)
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <div className="modal-backdrop" onMouseDown={(event) => {
+      if (event.target === event.currentTarget) onClose()
+    }}>
+      <section className="modal" role="dialog" aria-modal="true" aria-labelledby="schedule-title">
+        <div className="modal-header">
+          <div><span className="eyebrow">AUTOMATION</span><h2 id="schedule-title">New recurring job</h2></div>
+          <button className="icon-button" onClick={onClose} aria-label="Close dialog"><Icon name="close" /></button>
+        </div>
+        <p className="modal-intro">A job is created automatically every time the schedule fires.</p>
+        <form onSubmit={submit}>
+          <label className="field-label" htmlFor="schedule-name">Name <span>must be unique</span></label>
+          <input id="schedule-name" className="input-control" value={name} onChange={(event) => setName(event.target.value)} required maxLength={100} placeholder="e.g. daily-report" />
+
+          <label className="field-label delay-label" htmlFor="schedule-type">Job type</label>
+          <input id="schedule-type" className="input-control" value={type} onChange={(event) => setType(event.target.value)} required maxLength={100} />
+          <div className="type-suggestions">
+            {['SEND_EMAIL', 'NOOP', 'SLOW', 'ALWAYS_FAIL'].map((suggestion) => (
+              <button key={suggestion} type="button" onClick={() => changeType(suggestion)} className={type === suggestion ? 'suggestion active' : 'suggestion'}>{suggestion}</button>
+            ))}
+          </div>
+
+          <label className="field-label payload-label" htmlFor="schedule-cron">Cron <span>minute hour day month weekday</span></label>
+          <input id="schedule-cron" className="input-control code-input" value={cron} onChange={(event) => setCron(event.target.value)} required maxLength={120} spellCheck={false} />
+          <div className="type-suggestions">
+            {CRON_PRESETS.map((preset) => (
+              <button key={preset.value} type="button" onClick={() => setCron(preset.value)} className={cron === preset.value ? 'suggestion active' : 'suggestion'}>{preset.label}</button>
+            ))}
+          </div>
+
+          <label className="field-label delay-label" htmlFor="schedule-timezone">Time zone <span>e.g. Asia/Kolkata, UTC</span></label>
+          <input id="schedule-timezone" className="input-control" value={timezone} onChange={(event) => setTimezone(event.target.value)} maxLength={50} />
+
+          <label className="field-label delay-label" htmlFor="schedule-payload">Payload <span>JSON</span></label>
+          <textarea id="schedule-payload" className="input-control code-input" value={payload} onChange={(event) => setPayload(event.target.value)} rows={4} spellCheck={false} />
+
+          <div className="form-grid">
+            <div><label className="field-label" htmlFor="schedule-priority">Priority <span>1-10</span></label><input id="schedule-priority" className="input-control" type="number" min="1" max="10" value={priority} onChange={(event) => setPriority(event.target.value)} required /></div>
+            <div><label className="field-label" htmlFor="schedule-attempts">Max attempts <span>1-20</span></label><input id="schedule-attempts" className="input-control" type="number" min="1" max="20" value={maxAttempts} onChange={(event) => setMaxAttempts(event.target.value)} required /></div>
+          </div>
+
+          {error && <div className="form-error" role="alert"><Icon name="alert" size={16} />{error}</div>}
+          <div className="modal-actions">
+            <button type="button" className="button button-secondary" onClick={onClose}>Cancel</button>
+            <button type="submit" className="button button-primary" disabled={submitting}>{submitting ? <><span className="spinner spinner-white" />Saving...</> : <><Icon name="calendar" size={17} />Create schedule</>}</button>
+          </div>
+        </form>
+      </section>
+    </div>
+  )
+}
+
+function SchedulesPage({ schedules, loading, error, message, onCreate, onAction }) {
+  return (
+    <>
+      <section className="page-heading">
+        <div><span className="eyebrow">AUTOMATION</span><h1>Recurring jobs</h1><p>Create jobs automatically on a cron schedule.</p></div>
+        <button className="button button-primary new-job-button" onClick={onCreate}><Icon name="plus" size={18} />New schedule</button>
+      </section>
+
+      {error && <div className="connection-error" role="alert"><Icon name="alert" size={19} /><div><strong>Couldn't load schedules</strong><span>{error}</span></div></div>}
+      {message && <div className="schedule-note" role="status">{message}</div>}
+
+      <section className="jobs-panel">
+        <div className="panel-heading">
+          <div><div className="panel-title"><h2>Schedules</h2><span className="result-count">{schedules.length}</span></div><p>Each run creates a normal job in the queue</p></div>
+        </div>
+        {loading && schedules.length === 0 ? (
+          <div className="table-message"><span className="spinner" /> Loading schedules...</div>
+        ) : schedules.length === 0 ? (
+          <div className="empty-state">
+            <div className="empty-icon"><Icon name="calendar" size={25} /></div>
+            <strong>No schedules yet</strong>
+            <p>Create one to run a job every few minutes, hourly or daily.</p>
+            <button className="text-button" onClick={onCreate}>New schedule</button>
+          </div>
+        ) : (
+          <div className="table-scroll">
+            <table className="schedules-table">
+              <thead>
+                <tr>
+                  <th>Schedule</th>
+                  <th>Cron</th>
+                  <th>Next run</th>
+                  <th>Last run</th>
+                  <th>Status</th>
+                  <th aria-label="Actions" />
+                </tr>
+              </thead>
+              <tbody>
+                {schedules.map((schedule) => (
+                  <tr key={schedule.id}>
+                    <td><div className="job-cell"><span className="job-type">{schedule.name}</span><span className="job-id">{schedule.type}</span></div></td>
+                    <td><div className="job-cell"><code className="cron-code">{schedule.cron}</code><span className="job-id">{schedule.timezone}</span></div></td>
+                    <td><span className="created-time">{schedule.enabled ? relativeTime(schedule.nextRunAt) : DASH}</span></td>
+                    <td><span className="created-time">{relativeTime(schedule.lastRunAt)}</span></td>
+                    <td><StatusBadge status={schedule.enabled ? 'ACTIVE' : 'PAUSED'} /></td>
+                    <td>
+                      <div className="schedule-actions">
+                        <button className="button button-secondary button-small" onClick={() => onAction('trigger', schedule)}>Run now</button>
+                        <button className="button button-secondary button-small" onClick={() => onAction(schedule.enabled ? 'pause' : 'resume', schedule)}>{schedule.enabled ? 'Pause' : 'Resume'}</button>
+                        <button className="button button-danger button-small" onClick={() => onAction('delete', schedule)}>Delete</button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+    </>
+  )
+}
+
 function JobDrawer({ job, attempts, attemptsLoading, attemptsError, actionBusy, actionError, onCancel, onRetry, onClose }) {
   const canCancel = job.status === 'PENDING'
   const canRetry = job.status === 'DEAD' || job.status === 'FAILED'
@@ -282,6 +469,7 @@ function JobDrawer({ job, attempts, attemptsLoading, attemptsError, actionBusy, 
           <div><span>Created</span><strong>{formatDate(job.createdAt)}</strong></div>
           <div><span>Updated</span><strong>{formatDate(job.updatedAt)}</strong></div>
           <div><span>Scheduled</span><strong>{formatDate(job.runAt)}</strong></div>
+          <div><span>From schedule</span><strong>{job.scheduleId ? `#${shortId(job.scheduleId)}` : DASH}</strong></div>
         </div>
         <div className="drawer-section">
           <div className="section-title"><h3>Payload</h3><span>JSON</span></div>
@@ -308,6 +496,7 @@ function JobDrawer({ job, attempts, attemptsLoading, attemptsError, actionBusy, 
 }
 
 export default function App() {
+  const [view, setView] = useState('overview')
   const [jobs, setJobs] = useState([])
   const [total, setTotal] = useState(0)
   const [stats, setStats] = useState(null)
@@ -324,6 +513,11 @@ export default function App() {
   const [attemptsError, setAttemptsError] = useState('')
   const [actionBusy, setActionBusy] = useState(false)
   const [actionError, setActionError] = useState('')
+  const [schedules, setSchedules] = useState([])
+  const [schedulesLoading, setSchedulesLoading] = useState(true)
+  const [schedulesError, setSchedulesError] = useState('')
+  const [scheduleMessage, setScheduleMessage] = useState('')
+  const [scheduleModal, setScheduleModal] = useState(false)
   const selectedId = selectedJob ? selectedJob.id : null
 
   // One refresh loads the current page of jobs (filtered by status on the server) and the overall stats.
@@ -358,6 +552,25 @@ export default function App() {
     const interval = window.setInterval(() => refresh(), 5000)
     return () => window.clearInterval(interval)
   }, [refresh])
+
+  const loadSchedules = useCallback(async () => {
+    try {
+      setSchedules(await request('/api/schedules'))
+      setSchedulesError('')
+    } catch (loadError) {
+      setSchedulesError(loadError.message)
+    } finally {
+      setSchedulesLoading(false)
+    }
+  }, [])
+
+  // Schedules are only polled while their page is open.
+  useEffect(() => {
+    if (view !== 'schedules') return undefined
+    loadSchedules()
+    const interval = window.setInterval(loadSchedules, 5000)
+    return () => window.clearInterval(interval)
+  }, [view, loadSchedules])
 
   // While the drawer is open, keep the selected job and its attempts live.
   useEffect(() => {
@@ -436,6 +649,17 @@ export default function App() {
     setPage(0)
   }
 
+  function showJobs() {
+    setView('overview')
+    window.setTimeout(() => document.getElementById('jobs-section')?.scrollIntoView({ behavior: 'smooth' }), 60)
+  }
+
+  function handleScheduleCreated(schedule) {
+    setScheduleModal(false)
+    setScheduleMessage(`Created schedule "${schedule.name}". It fires ${relativeTime(schedule.nextRunAt)}.`)
+    loadSchedules()
+  }
+
   async function runAction(kind) {
     if (!selectedJob) return
     if (kind === 'cancel' && !window.confirm('Cancel this job? It will not run.')) return
@@ -454,6 +678,27 @@ export default function App() {
     }
   }
 
+  async function scheduleAction(kind, schedule) {
+    if (kind === 'delete' && !window.confirm(`Delete schedule "${schedule.name}"? Jobs it already created are kept.`)) return
+    setScheduleMessage('')
+    try {
+      if (kind === 'trigger') {
+        const job = await request(`/api/schedules/${schedule.id}/trigger`, { method: 'POST' })
+        setScheduleMessage(`Created job #${shortId(job.id)} from "${schedule.name}".`)
+      } else if (kind === 'delete') {
+        await request(`/api/schedules/${schedule.id}`, { method: 'DELETE' })
+        setScheduleMessage(`Deleted "${schedule.name}".`)
+      } else {
+        await request(`/api/schedules/${schedule.id}/${kind}`, { method: 'POST' })
+      }
+    } catch (actionFailure) {
+      setScheduleMessage(actionFailure.message)
+    } finally {
+      loadSchedules()
+      refresh()
+    }
+  }
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -468,8 +713,9 @@ export default function App() {
         </div>
         <div className="nav-label">WORKSPACE</div>
         <nav className="side-nav" aria-label="Main navigation">
-          <button className="nav-item active"><Icon name="grid" size={18} />Overview</button>
-          <button className="nav-item" onClick={() => document.getElementById('jobs-section')?.scrollIntoView({ behavior: 'smooth' })}><Icon name="layers" size={18} />Jobs<span className="nav-count">{counts.total}</span></button>
+          <button className={view === 'overview' ? 'nav-item active' : 'nav-item'} onClick={() => setView('overview')}><Icon name="grid" size={18} />Overview</button>
+          <button className="nav-item" onClick={showJobs}><Icon name="layers" size={18} />Jobs<span className="nav-count">{counts.total}</span></button>
+          <button className={view === 'schedules' ? 'nav-item active' : 'nav-item'} onClick={() => setView('schedules')}><Icon name="calendar" size={18} />Schedules</button>
         </nav>
         <div className="sidebar-bottom">
           <div className="api-status"><span className={`connection-dot ${error ? 'offline' : ''}`} /><span><strong>{loading ? 'Connecting...' : error ? 'API unavailable' : 'API connected'}</strong><small>{error ? 'Check your connection' : 'localhost:8081'}</small></span></div>
@@ -479,58 +725,65 @@ export default function App() {
 
       <main className="main-content">
         <header className="topbar">
-          <div className="breadcrumbs"><span>Job Queue</span><Icon name="chevron" size={14} /><strong>Overview</strong></div>
-          <div className="topbar-right"><span className="live-indicator"><span />Live updates</span><button className="icon-button refresh-button" onClick={() => refresh()} aria-label="Refresh jobs"><Icon name="refresh" /></button></div>
+          <div className="breadcrumbs"><span>Job Queue</span><Icon name="chevron" size={14} /><strong>{view === 'schedules' ? 'Schedules' : 'Overview'}</strong></div>
+          <div className="topbar-right"><span className="live-indicator"><span />Live updates</span><button className="icon-button refresh-button" onClick={() => (view === 'schedules' ? loadSchedules() : refresh())} aria-label="Refresh"><Icon name="refresh" /></button></div>
         </header>
 
         <div className="page-content">
-          <section className="page-heading">
-            <div><span className="eyebrow">MONITORING</span><h1>Job overview</h1><p>Track and manage the work flowing through your queue.</p></div>
-            <button className="button button-primary new-job-button" onClick={() => setSubmitting(true)}><Icon name="plus" size={18} />Create job</button>
-          </section>
+          {view === 'schedules' ? (
+            <SchedulesPage schedules={schedules} loading={schedulesLoading} error={schedulesError} message={scheduleMessage} onCreate={() => setScheduleModal(true)} onAction={scheduleAction} />
+          ) : (
+            <>
+              <section className="page-heading">
+                <div><span className="eyebrow">MONITORING</span><h1>Job overview</h1><p>Track and manage the work flowing through your queue.</p></div>
+                <button className="button button-primary new-job-button" onClick={() => setSubmitting(true)}><Icon name="plus" size={18} />Create job</button>
+              </section>
 
-          {error && <div className="connection-error" role="alert"><Icon name="alert" size={19} /><div><strong>Couldn't load jobs</strong><span>{error} - Check that the API is running on port 8081.</span></div><button className="text-button" onClick={() => refresh(true)}>Try again</button></div>}
+              {error && <div className="connection-error" role="alert"><Icon name="alert" size={19} /><div><strong>Couldn't load jobs</strong><span>{error} - Check that the API is running on port 8081.</span></div><button className="text-button" onClick={() => refresh(true)}>Try again</button></div>}
 
-          <section className="metrics-grid" aria-label="Job metrics">
-            <MetricCard label="Total jobs" count={counts.total} icon="layers" tone="metric-purple" loading={statsLoading} />
-            <MetricCard label="Pending" count={counts.pending} icon="clock" tone="metric-amber" loading={statsLoading} />
-            <MetricCard label="Running" count={counts.running} icon="activity" tone="metric-blue" loading={statsLoading} />
-            <MetricCard label="Succeeded" count={counts.succeeded} icon="check" tone="metric-green" loading={statsLoading} />
-            <MetricCard label="Dead letters" count={counts.dead} icon="alert" tone="metric-red" loading={statsLoading} />
-          </section>
+              <section className="metrics-grid" aria-label="Job metrics">
+                <MetricCard label="Total jobs" count={counts.total} icon="layers" tone="metric-purple" loading={statsLoading} />
+                <MetricCard label="Pending" count={counts.pending} icon="clock" tone="metric-amber" loading={statsLoading} />
+                <MetricCard label="Running" count={counts.running} icon="activity" tone="metric-blue" loading={statsLoading} />
+                <MetricCard label="Succeeded" count={counts.succeeded} icon="check" tone="metric-green" loading={statsLoading} />
+                <MetricCard label="Dead letters" count={counts.dead} icon="alert" tone="metric-red" loading={statsLoading} />
+              </section>
 
-          {stats && (
-            <div className="stats-strip">
-              <span className="stat-item"><span className="stat-dot" />Finished in the last minute: <strong>{stats.succeededLastMinute}</strong></span>
-              <span className="stat-item"><span className="stat-dot amber" />Longest wait for a runnable job: <strong>{formatWait(stats.oldestDuePendingSeconds)}</strong></span>
-            </div>
+              {stats && (
+                <div className="stats-strip">
+                  <span className="stat-item"><span className="stat-dot" />Finished in the last minute: <strong>{stats.succeededLastMinute}</strong></span>
+                  <span className="stat-item"><span className="stat-dot amber" />Longest wait for a runnable job: <strong>{formatWait(stats.oldestDuePendingSeconds)}</strong></span>
+                </div>
+              )}
+
+              <section className="jobs-panel" id="jobs-section">
+                <div className="panel-heading">
+                  <div><div className="panel-title"><h2>Jobs</h2><span className="result-count">{total}</span></div><p>Newest first <span>- {PAGE_SIZE} per page</span></p></div>
+                  <span className="updated-time">{lastUpdated ? `Updated ${relativeTime(lastUpdated)}` : 'Waiting for data'}</span>
+                </div>
+                <div className="table-toolbar">
+                  <label className="search-field"><Icon name="search" size={17} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search this page..." aria-label="Search jobs on this page" />{search && <button onClick={() => setSearch('')} aria-label="Clear search"><Icon name="close" size={14} /></button>}</label>
+                  <label className="filter-field"><Icon name="sliders" size={16} /><select value={filter} onChange={(event) => changeFilter(event.target.value)} aria-label="Filter by status"><option value="ALL">All statuses</option>{STATUSES.map((status) => <option key={status} value={status}>{status}</option>)}</select></label>
+                </div>
+                <JobTable jobs={visibleJobs} loading={loading} onSelect={openJob} onClear={clearFilters} />
+                <div className="table-footer">
+                  <span>Showing <strong>{firstShown}-{lastShown}</strong> of <strong>{total}</strong> jobs</span>
+                  <span className="pager">
+                    <button className="button button-secondary button-small" onClick={() => setPage(page - 1)} disabled={page === 0}>Previous</button>
+                    <span className="pager-page">Page {page + 1}</span>
+                    <button className="button button-secondary button-small" onClick={() => setPage(page + 1)} disabled={(page + 1) * PAGE_SIZE >= total}>Next</button>
+                  </span>
+                  <span className="auto-refresh"><span />Auto-refreshes every 5 seconds</span>
+                </div>
+              </section>
+            </>
           )}
-
-          <section className="jobs-panel" id="jobs-section">
-            <div className="panel-heading">
-              <div><div className="panel-title"><h2>Jobs</h2><span className="result-count">{total}</span></div><p>Newest first <span>- {PAGE_SIZE} per page</span></p></div>
-              <span className="updated-time">{lastUpdated ? `Updated ${relativeTime(lastUpdated)}` : 'Waiting for data'}</span>
-            </div>
-            <div className="table-toolbar">
-              <label className="search-field"><Icon name="search" size={17} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search this page..." aria-label="Search jobs on this page" />{search && <button onClick={() => setSearch('')} aria-label="Clear search"><Icon name="close" size={14} /></button>}</label>
-              <label className="filter-field"><Icon name="sliders" size={16} /><select value={filter} onChange={(event) => changeFilter(event.target.value)} aria-label="Filter by status"><option value="ALL">All statuses</option>{STATUSES.map((status) => <option key={status} value={status}>{status}</option>)}</select></label>
-            </div>
-            <JobTable jobs={visibleJobs} loading={loading} onSelect={openJob} onClear={clearFilters} />
-            <div className="table-footer">
-              <span>Showing <strong>{firstShown}-{lastShown}</strong> of <strong>{total}</strong> jobs</span>
-              <span className="pager">
-                <button className="button button-secondary button-small" onClick={() => setPage(page - 1)} disabled={page === 0}>Previous</button>
-                <span className="pager-page">Page {page + 1}</span>
-                <button className="button button-secondary button-small" onClick={() => setPage(page + 1)} disabled={(page + 1) * PAGE_SIZE >= total}>Next</button>
-              </span>
-              <span className="auto-refresh"><span />Auto-refreshes every 5 seconds</span>
-            </div>
-          </section>
           <footer className="page-footer"><span>Queueboard <span>|</span> Job Queue Console</span><span>{lastUpdated ? `Last synced ${formatDate(lastUpdated)}` : 'Connecting to API...'}</span></footer>
         </div>
       </main>
 
       {submitting && <SubmitModal onClose={() => setSubmitting(false)} onSubmitted={handleSubmitted} />}
+      {scheduleModal && <ScheduleModal onClose={() => setScheduleModal(false)} onCreated={handleScheduleCreated} />}
       {selectedJob && <JobDrawer job={selectedJob} attempts={attempts} attemptsLoading={attemptsLoading} attemptsError={attemptsError} actionBusy={actionBusy} actionError={actionError} onCancel={() => runAction('cancel')} onRetry={() => runAction('retry')} onClose={() => setSelectedJob(null)} />}
     </div>
   )
