@@ -1,6 +1,8 @@
 package com.example.jobqueue.schedule;
 
 import com.example.jobqueue.worker.WorkerProperties;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.PreDestroy;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -21,11 +23,15 @@ public class ScheduleRunner {
 
     private final ScheduleService service;
     private final WorkerProperties props;
+    private final Counter firedCounter;
     private ScheduledExecutorService scheduler;
 
-    public ScheduleRunner(ScheduleService service, WorkerProperties props) {
+    public ScheduleRunner(ScheduleService service, WorkerProperties props, MeterRegistry meters) {
         this.service = service;
         this.props = props;
+        this.firedCounter = Counter.builder("jobqueue.schedules.fired")
+                .description("Recurring-schedule runs that created a job")
+                .register(meters);
     }
 
     @EventListener(ApplicationReadyEvent.class)
@@ -40,6 +46,7 @@ public class ScheduleRunner {
         try {
             int fired = service.fireDueSchedules();
             if (fired > 0) {
+                firedCounter.increment(fired);
                 log.info("Scheduler created jobs for {} due schedule(s)", fired);
             }
         } catch (Exception e) {

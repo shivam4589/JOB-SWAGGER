@@ -16,6 +16,8 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import org.awaitility.Awaitility;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -104,6 +106,9 @@ class WorkerEndToEndTest {
     @Autowired
     JdbcClient jdbc;
 
+    @Autowired
+    MeterRegistry meters;
+
     @BeforeEach
     void reset() {
         jdbc.sql("DELETE FROM jobs").update();
@@ -130,6 +135,20 @@ class WorkerEndToEndTest {
 
         assertThat(counting.runs.keySet()).isEqualTo(ids);
         assertThat(counting.runs.values()).allMatch(count -> count.get() == 1);
+    }
+
+    @Test
+    void workerRecordsDurationMetrics() {
+        ObjectNode payload = mapper.createObjectNode();
+        for (int i = 0; i < 10; i++) {
+            repository.insert(UUID.randomUUID(), "COUNT", payload, 5, 0, 5);
+        }
+        Awaitility.await().atMost(Duration.ofSeconds(30)).until(
+                () -> repository.list(JobStatus.SUCCEEDED, 200).size() == 10);
+
+        long recorded = meters.find("jobqueue.job.duration").tag("outcome", "success")
+                .timers().stream().mapToLong(Timer::count).sum();
+        assertThat(recorded).isGreaterThanOrEqualTo(10);
     }
 
     @Test

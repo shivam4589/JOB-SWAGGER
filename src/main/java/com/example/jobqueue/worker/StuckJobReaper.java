@@ -1,6 +1,8 @@
 package com.example.jobqueue.worker;
 
 import com.example.jobqueue.repo.JobRepository;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.PreDestroy;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -24,11 +26,15 @@ public class StuckJobReaper {
 
     private final JobRepository repository;
     private final WorkerProperties props;
+    private final Counter reclaimedCounter;
     private ScheduledExecutorService scheduler;
 
-    public StuckJobReaper(JobRepository repository, WorkerProperties props) {
+    public StuckJobReaper(JobRepository repository, WorkerProperties props, MeterRegistry meters) {
         this.repository = repository;
         this.props = props;
+        this.reclaimedCounter = Counter.builder("jobqueue.reaper.reclaimed")
+                .description("Jobs taken back from workers that stopped responding")
+                .register(meters);
     }
 
     @EventListener(ApplicationReadyEvent.class)
@@ -43,6 +49,7 @@ public class StuckJobReaper {
         try {
             int reclaimed = repository.reapStuckJobs(props.lockTimeoutSeconds());
             if (reclaimed > 0) {
+                reclaimedCounter.increment(reclaimed);
                 log.warn("Reaper reclaimed {} abandoned job(s)", reclaimed);
             }
         } catch (Exception e) {

@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 10s
+
+scrape_configs:
+  - job_name: api
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["api:8080"]
+
+  # "worker" resolves to every worker container, so scaling workers up or down is picked up automatically.
+  - job_name: worker
+    metrics_path: /actuator/prometheus
+    dns_sd_configs:
+      - names: ["worker"]
+        type: A
+        port: 8080
+        refresh_interval: 10s

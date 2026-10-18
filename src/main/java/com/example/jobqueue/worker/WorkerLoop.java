@@ -2,8 +2,12 @@ package com.example.jobqueue.worker;
 
 import com.example.jobqueue.domain.Job;
 import com.example.jobqueue.repo.JobRepository;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import jakarta.annotation.PreDestroy;
 import java.net.InetAddress;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
@@ -21,6 +25,12 @@ import org.springframework.stereotype.Component;
  * Delivery is at-least-once: a job can run again if its worker dies, so handlers
  * should be idempotent.
  * Only created when jobqueue.worker.enabled=true, so the API container stays a pure API.
+ *
+ * Metrics (Micrometer, exported to Prometheus):
+ *   jobqueue.job.duration    timer, time inside the handler, tags: type, outcome (success / failure)
+ *   jobqueue.job.queue.wait  timer, time between a job becoming due and a worker picking it up
+ *   jobqueue.job.retries     counter, failed attempts that were scheduled for retry
+ *   jobqueue.job.dead        counter, jobs that ran out of attempts
  */
 @Component
 @ConditionalOnProperty(name = "jobqueue.worker.enabled", havingValue = "true")
@@ -33,15 +43,18 @@ public class WorkerLoop {
     private final JobHandlerRegistry registry;
     private final WorkerProperties props;
     private final BackoffPolicy backoff;
+    private final MeterRegistry meters;
 
     private ExecutorService executor;
     private volatile boolean running;
 
-    public WorkerLoop(JobRepository repository, JobHandlerRegistry registry, WorkerProperties props) {
+    public WorkerLoop(JobRepository repository, JobHandlerRegistry registry, WorkerProperties props,
+                      MeterRegistry meters) {
         this.repository = repository;
         this.registry = registry;
         this.props = props;
         this.backoff = new BackoffPolicy(props.backoffBaseSeconds(), props.backoffMaxSeconds());
+        this.meters = meters;
     }
 
     @EventListener(ApplicationReadyEvent.class)
@@ -101,11 +114,25 @@ public class WorkerLoop {
     }
 
     private void execute(Job job, String workerId) {
+        recordQueueWait(job);
         long attemptId = repository.startAttempt(job.id(), workerId);
+
+        Timer.Sample sample = Timer.start(meters);
+        Exception handlerError = null;
         try {
             JobHandler handler = registry.find(job.type()).orElseThrow(
                     () -> new IllegalStateException("No handler registered for job type " + job.type()));
             handler.handle(job);
+        } catch (Exception e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            handlerError = e;
+        }
+        // Measure before touching the database, so anything that sees the new job status also sees the measurement.
+        sample.stop(durationTimer(job.type(), handlerError == null ? "success" : "failure"));
+
+        if (handlerError == null) {
             repository.finishAttempt(attemptId, true, null);
             if (repository.markSucceeded(job.id(), workerId) == 0) {
                 log.warn("Job {} finished but this worker no longer holds its lock (reclaimed by the reaper?)",
@@ -114,11 +141,8 @@ public class WorkerLoop {
                 log.info("Job {} ({}) succeeded on attempt {} by {}",
                         job.id(), job.type(), job.attempts(), workerId);
             }
-        } catch (Exception e) {
-            if (e instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
-            }
-            handleFailure(job, workerId, attemptId, truncate(e.toString()));
+        } else {
+            handleFailure(job, workerId, attemptId, truncate(handlerError.toString()));
         }
     }
 
@@ -126,15 +150,44 @@ public class WorkerLoop {
         repository.finishAttempt(attemptId, false, error);
         if (job.attempts() >= job.maxAttempts()) {
             repository.markDead(job.id(), workerId, error);
+            meters.counter("jobqueue.job.dead", "type", job.type()).increment();
             log.error("Job {} ({}) is DEAD after {} attempts: {}",
                     job.id(), job.type(), job.attempts(), error);
         } else {
             double delay = backoff.delaySeconds(job.attempts());
             repository.scheduleRetry(job.id(), workerId, error, delay);
+            meters.counter("jobqueue.job.retries", "type", job.type()).increment();
             log.warn("Job {} ({}) failed attempt {}/{}, retrying in {}s: {}",
                     job.id(), job.type(), job.attempts(), job.maxAttempts(),
                     String.format("%.1f", delay), error);
         }
+    }
+
+    private Timer durationTimer(String type, String outcome) {
+        return Timer.builder("jobqueue.job.duration")
+                .description("Time spent inside the job handler")
+                .tag("type", type)
+                .tag("outcome", outcome)
+                .publishPercentileHistogram()
+                .minimumExpectedValue(Duration.ofMillis(1))
+                .maximumExpectedValue(Duration.ofMinutes(5))
+                .register(meters);
+    }
+
+    /** How long the job sat in the queue after it became due (clock differences can make this slightly negative). */
+    private void recordQueueWait(Job job) {
+        Duration wait = Duration.between(job.runAt(), Instant.now());
+        if (wait.isNegative()) {
+            wait = Duration.ZERO;
+        }
+        Timer.builder("jobqueue.job.queue.wait")
+                .description("Time between a job becoming due and a worker picking it up")
+                .tag("type", job.type())
+                .publishPercentileHistogram()
+                .minimumExpectedValue(Duration.ofMillis(1))
+                .maximumExpectedValue(Duration.ofMinutes(10))
+                .register(meters)
+                .record(wait);
     }
 
     private static String truncate(String s) {
