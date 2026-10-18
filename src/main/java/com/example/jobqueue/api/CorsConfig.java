@@ -26,6 +26,6 @@ public class CorsConfig implements WebMvcConfigurer {
                 .allowedOriginPatterns(allowedOrigins)
                 .allowedMethods("GET", "POST", "DELETE", "OPTIONS")
                 .allowedHeaders("*")
-                .exposedHeaders("X-Total-Count");
+                .exposedHeaders("X-Total-Count", "Idempotent-Replayed");
     }
 }

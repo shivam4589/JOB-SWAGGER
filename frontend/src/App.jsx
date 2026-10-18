@@ -43,6 +43,17 @@ async function requestPage(url) {
   return { items, total: header === null ? items.length : Number(header) }
 }
 
+// Like request(), but also reports whether the server answered with an earlier job (same Idempotency-Key).
+async function submitJobRequest(url, options) {
+  const response = await fetch(url, options)
+  if (!response.ok) throw new Error(await errorMessage(response))
+  return { job: await response.json(), replayed: response.headers.get('Idempotent-Replayed') === 'true' }
+}
+
+function newKey() {
+  return window.crypto && window.crypto.randomUUID ? window.crypto.randomUUID() : `key-${Date.now()}`
+}
+
 function browserZone() {
   try {
     return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
@@ -180,6 +191,7 @@ function JobTable({ jobs, loading, onSelect, onClear }) {
 }
 
 function SubmitModal({ onClose, onSubmitted }) {
+  const [idempotencyKey, setIdempotencyKey] = useState('')
   const [type, setType] = useState('SEND_EMAIL')
   const [payload, setPayload] = useState('{\n  "to": "user@example.com"\n}')
   const [priority, setPriority] = useState('5')
@@ -212,9 +224,10 @@ function SubmitModal({ onClose, onSubmitted }) {
 
     setSubmitting(true)
     try {
-      const job = await request('/api/jobs', {
+      const key = idempotencyKey.trim()
+      const { job, replayed } = await submitJobRequest('/api/jobs', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: key ? { 'Content-Type': 'application/json', 'Idempotency-Key': key } : { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           type: type.trim(),
           payload: parsedPayload,
@@ -223,7 +236,7 @@ function SubmitModal({ onClose, onSubmitted }) {
           maxAttempts: Number(maxAttempts),
         }),
       })
-      onSubmitted(job)
+      onSubmitted(job, replayed)
     } catch (submissionError) {
       setError(submissionError.message)
     } finally {
@@ -259,6 +272,12 @@ function SubmitModal({ onClose, onSubmitted }) {
           </div>
           <label className="field-label delay-label" htmlFor="job-delay">Delay <span>seconds before the job can run</span></label>
           <input id="job-delay" className="input-control" type="number" min="0" value={delaySeconds} onChange={(event) => setDelaySeconds(event.target.value)} required />
+
+          <label className="field-label delay-label" htmlFor="job-key">Idempotency key <span>optional - same key and same job = no duplicate</span></label>
+          <input id="job-key" className="input-control" value={idempotencyKey} onChange={(event) => setIdempotencyKey(event.target.value)} maxLength={200} spellCheck={false} placeholder="e.g. invoice-1042-email" />
+          <div className="type-suggestions">
+            <button type="button" className="suggestion" onClick={() => setIdempotencyKey(newKey())}>Generate random key</button>
+          </div>
 
           {error && <div className="form-error" role="alert"><Icon name="alert" size={16} />{error}</div>}
           <div className="modal-actions">
@@ -470,6 +489,7 @@ function JobDrawer({ job, attempts, attemptsLoading, attemptsError, actionBusy, 
           <div><span>Updated</span><strong>{formatDate(job.updatedAt)}</strong></div>
           <div><span>Scheduled</span><strong>{formatDate(job.runAt)}</strong></div>
           <div><span>From schedule</span><strong>{job.scheduleId ? `#${shortId(job.scheduleId)}` : DASH}</strong></div>
+          <div><span>Idempotency key</span><strong>{job.idempotencyKey ?? DASH}</strong></div>
         </div>
         <div className="drawer-section">
           <div className="section-title"><h3>Payload</h3><span>JSON</span></div>
@@ -518,6 +538,7 @@ export default function App() {
   const [schedulesError, setSchedulesError] = useState('')
   const [scheduleMessage, setScheduleMessage] = useState('')
   const [scheduleModal, setScheduleModal] = useState(false)
+  const [notice, setNotice] = useState('')
   const selectedId = selectedJob ? selectedJob.id : null
 
   // One refresh loads the current page of jobs (filtered by status on the server) and the overall stats.
@@ -631,11 +652,15 @@ export default function App() {
     setSelectedJob(job)
   }
 
-  function handleSubmitted(job) {
+  function handleSubmitted(job, replayed) {
     setSubmitting(false)
     setPage(0)
     openJob(job)
     refresh()
+    if (replayed) {
+      setNotice(`An identical job already exists (#${shortId(job.id)}, ${job.status}). No duplicate was created.`)
+      window.setTimeout(() => setNotice(''), 8000)
+    }
   }
 
   function changeFilter(value) {
@@ -740,6 +765,8 @@ export default function App() {
               </section>
 
               {error && <div className="connection-error" role="alert"><Icon name="alert" size={19} /><div><strong>Couldn't load jobs</strong><span>{error} - Check that the API is running on port 8081.</span></div><button className="text-button" onClick={() => refresh(true)}>Try again</button></div>}
+
+              {notice && <div className="schedule-note" role="status">{notice}</div>}
 
               <section className="metrics-grid" aria-label="Job metrics">
                 <MetricCard label="Total jobs" count={counts.total} icon="layers" tone="metric-purple" loading={statsLoading} />

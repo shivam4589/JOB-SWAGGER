@@ -24,8 +24,13 @@ public class GlobalExceptionHandler {
         return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, ex.getMessage());
     }
 
-    @ExceptionHandler(InvalidScheduleException.class)
-    public ProblemDetail invalidSchedule(InvalidScheduleException ex) {
+    @ExceptionHandler(IdempotencyKeyReuseException.class)
+    public ProblemDetail keyReuse(IdempotencyKeyReuseException ex) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.UNPROCESSABLE_ENTITY, ex.getMessage());
+    }
+
+    @ExceptionHandler({InvalidScheduleException.class, InvalidIdempotencyKeyException.class})
+    public ProblemDetail badRequest(RuntimeException ex) {
         return ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, ex.getMessage());
     }
 

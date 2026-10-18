@@ -13,6 +13,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -27,10 +28,21 @@ public class JobController {
         this.service = service;
     }
 
+    /**
+     * Optional Idempotency-Key header. First request: 201 Created. The same key with the same request again:
+     * 200 OK with the original job and "Idempotent-Replayed: true". The same key with a different request: 422.
+     */
     @PostMapping
-    public ResponseEntity<Job> submit(@Valid @RequestBody SubmitJobRequest request) {
-        Job job = service.submit(request);
-        return ResponseEntity.created(URI.create("/api/jobs/" + job.id())).body(job);
+    public ResponseEntity<Job> submit(
+            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
+            @Valid @RequestBody SubmitJobRequest request) {
+        JobService.SubmitResult result = service.submit(request, idempotencyKey);
+        Job job = result.job();
+        URI location = URI.create("/api/jobs/" + job.id());
+        if (result.created()) {
+            return ResponseEntity.created(location).body(job);
+        }
+        return ResponseEntity.ok().location(location).header("Idempotent-Replayed", "true").body(job);
     }
 
     @GetMapping("/{id}")

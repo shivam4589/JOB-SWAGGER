@@ -68,6 +68,44 @@ public class JobRepository {
                 .single();
     }
 
+    /** A job together with the fingerprint of the request that created it (used for idempotency checks). */
+    public record StoredJob(Job job, String requestHash) {
+    }
+
+    /**
+     * Inserts a job under an idempotency key. If the key already exists, nothing is inserted and the result
+     * is empty. The unique index makes this safe when several requests with one key arrive at the same time:
+     * exactly one inserts, the others see the conflict.
+     */
+    public Optional<Job> insertIdempotent(UUID id, String idempotencyKey, String requestHash, String type,
+                                          JsonNode payload, int priority, int delaySeconds, int maxAttempts) {
+        return jdbc.sql("""
+                INSERT INTO jobs (id, type, payload, status, priority, run_at, max_attempts,
+                                  idempotency_key, request_hash)
+                VALUES (:id, :type, CAST(:payload AS jsonb), 'PENDING', :priority,
+                        now() + (:delay * INTERVAL '1 second'), :maxAttempts, :key, :hash)
+                ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+                RETURNING *
+                """)
+                .param("id", id)
+                .param("type", type)
+                .param("payload", payload.toString())
+                .param("priority", priority)
+                .param("delay", delaySeconds)
+                .param("maxAttempts", maxAttempts)
+                .param("key", idempotencyKey)
+                .param("hash", requestHash)
+                .query(this::map)
+                .optional();
+    }
+
+    public Optional<StoredJob> findByIdempotencyKey(String idempotencyKey) {
+        return jdbc.sql("SELECT * FROM jobs WHERE idempotency_key = :key")
+                .param("key", idempotencyKey)
+                .query((rs, i) -> new StoredJob(map(rs, i), rs.getString("request_hash")))
+                .optional();
+    }
+
     public Optional<Job> findById(UUID id) {
         return jdbc.sql("SELECT * FROM jobs WHERE id = :id")
                 .param("id", id)
@@ -335,7 +373,8 @@ public class JobRepository {
                     rs.getString("last_error"),
                     rs.getTimestamp("created_at").toInstant(),
                     rs.getTimestamp("updated_at").toInstant(),
-                    rs.getObject("schedule_id", UUID.class));
+                    rs.getObject("schedule_id", UUID.class),
+                    rs.getString("idempotency_key"));
         } catch (JsonProcessingException e) {
             throw new SQLException("Invalid JSON payload in database", e);
         }

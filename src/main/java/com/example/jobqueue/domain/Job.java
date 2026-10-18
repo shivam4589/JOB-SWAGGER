@@ -16,5 +16,6 @@ public record Job(
         String lastError,
         Instant createdAt,
         Instant updatedAt,
-        UUID scheduleId) {
+        UUID scheduleId,
+        String idempotencyKey) {
 }
