@@ -2,117 +2,180 @@
 
 [![CI](https://github.com/shivam4589/JOB-SWAGGER/actions/workflows/ci.yml/badge.svg)](https://github.com/shivam4589/JOB-SWAGGER/actions/workflows/ci.yml)
 
-A distributed job scheduler / task queue built on PostgreSQL.
-Clients submit jobs over REST; worker containers (added in phase 2) claim jobs safely
-using `SELECT ... FOR UPDATE SKIP LOCKED`.
+A distributed background-job queue built on **PostgreSQL**, with a **Spring Boot** API, horizontally scalable **worker containers**, a **React dashboard**, and **Prometheus / Grafana** monitoring.
 
-## Run
+Clients submit jobs over REST. A fleet of worker containers claims them safely (no job is ever handed to two workers), retries failures with exponential backoff, parks hopeless jobs in a dead-letter state, and recovers jobs from workers that crash. Recurring jobs run on cron schedules. Everything runs with one `docker compose up`.
 
-```bash
-docker compose up --build
+## Features
+
+- **Safe concurrent claiming**: workers claim jobs with `SELECT ... FOR UPDATE SKIP LOCKED`, so any number of workers can poll one table without blocking each other or running a job twice.
+- **Retries with exponential backoff and jitter**, then a **dead-letter** state after the attempt limit. Dead jobs can be retried manually.
+- **Crash recovery**: a reaper returns jobs from lost workers to the queue. Verified by killing a worker container mid-job.
+- **Recurring jobs**: cron schedules (5- or 6-field cron, time zones), fired exactly once even with many worker containers ticking at the same time.
+- **Idempotency keys**: repeat a submit with the same `Idempotency-Key` and get the original job back instead of a duplicate.
+- **Priorities, delayed jobs, cancellation**, and a full per-attempt audit trail (worker, timing, error).
+- **React dashboard**: live stats, paged and filterable job list, job details with attempts, create/cancel/retry, schedules page.
+- **Observability**: Prometheus metrics (queue depth, throughput, duration and queue-wait percentiles, retries, dead letters) and a provisioned Grafana dashboard.
+- **Tested**: unit tests plus integration tests against real PostgreSQL (Testcontainers), including concurrency tests. CI runs everything on every push.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    UI[React dashboard] -->|REST| API[Spring Boot API]
+    CLI[API clients] -->|REST| API
+    API --> DB[(PostgreSQL)]
+    W1[Worker container 1] --> DB
+    W2[Worker container 2] --> DB
+    WN[Worker container N] --> DB
+    P[Prometheus] -. scrapes .-> API
+    P -. scrapes .-> W1
+    P -. scrapes .-> W2
+    P -. scrapes .-> WN
+    G[Grafana] --> P
 ```
 
-- API: http://localhost:8081
-- Swagger UI: http://localhost:8081/swagger-ui.html
-- Health: http://localhost:8081/actuator/health
+The API and the workers are the same Spring Boot application started in different modes (`JOBQUEUE_WORKER_ENABLED`). PostgreSQL is the only shared state: it is the queue, the audit log and the lock manager.
 
-## Frontend
+### Job lifecycle
 
-The React dashboard is in `frontend/`. Start the API and database with Docker Compose, then run the frontend in a separate terminal:
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: submitted or schedule fires
+    PENDING --> RUNNING: worker claims it
+    PENDING --> CANCELLED: cancel
+    RUNNING --> SUCCEEDED: handler succeeds
+    RUNNING --> PENDING: failure with attempts left, after backoff
+    RUNNING --> PENDING: worker lost, reaper reclaims
+    RUNNING --> DEAD: no attempts left
+    DEAD --> PENDING: manual retry
+```
+
+## Quick start
+
+Requires Docker (Docker Desktop on Windows/macOS). About 4 GB of RAM available to Docker is comfortable.
+
+```bash
+git clone https://github.com/shivam4589/JOB-SWAGGER.git
+cd JOB-SWAGGER
+docker compose up -d --build --scale worker=2
+```
+
+The first build takes a few minutes. Then:
+
+| What | Where |
+|---|---|
+| REST API | http://localhost:8081 |
+| Swagger UI | http://localhost:8081/swagger-ui.html |
+| Grafana dashboard | http://localhost:3000 (anonymous viewer; `admin` / `admin` to edit) |
+| Prometheus | http://localhost:9090 |
+| PostgreSQL | `localhost:5432`, user / password / database `jobqueue` |
+
+Run the dashboard (needs Node 18+):
 
 ```bash
 cd frontend
 npm install
-npm run dev
+npm run dev      # http://localhost:5173, proxies /api to localhost:8081
 ```
 
-Open the URL printed by Vite (usually http://localhost:5173). The dashboard proxies API requests to `http://localhost:8081`, refreshes job data every five seconds, and supports submitting jobs and viewing their attempts.
-
-To create a production bundle, run `npm run build` from `frontend/`; the output is written to `frontend/dist/`.
-
-## Try it
+### Try it
 
 ```bash
-# submit a job
-curl -X POST localhost:8081/api/jobs -H "Content-Type: application/json" \
+# submit a job (the Idempotency-Key header is optional)
+curl -X POST localhost:8081/api/jobs \
+  -H "Content-Type: application/json" -H "Idempotency-Key: order-1001" \
   -d '{"type":"SEND_EMAIL","payload":{"to":"user@example.com"},"priority":7}'
 
-# check status
-curl localhost:8081/api/jobs/<id>
+# the same request again returns the same job with 200 and "Idempotent-Replayed: true"
 
-# list pending jobs
-curl "localhost:8081/api/jobs?status=PENDING&limit=20"
+# a recurring job: every weekday at 09:00 India time
+curl -X POST localhost:8081/api/schedules \
+  -H "Content-Type: application/json" \
+  -d '{"name":"daily-report","type":"SEND_EMAIL","payload":{"to":"team@example.com"},"cron":"0 9 * * 1-5","timezone":"Asia/Kolkata"}'
+
+# queue statistics
+curl localhost:8081/api/stats
 ```
 
-## Workers
+Built-in demo job types: `SEND_EMAIL` (simulates 300 ms of work), `NOOP`, `SLOW` (`{"seconds": N}`), and `ALWAYS_FAIL` (to watch retries and dead-lettering). To add a job type, implement the `JobHandler` interface and annotate the class with `@Component`.
+
+### Crash recovery demo
 
 ```bash
-docker compose up -d --build --scale worker=3   # 3 worker containers x 4 threads each
+# submit a 20-second job and see which worker container is running it
+curl -X POST localhost:8081/api/jobs -H "Content-Type: application/json" \
+  -d '{"type":"SLOW","payload":{"seconds":20}}'
+docker compose exec postgres psql -U jobqueue -c "SELECT id, status, locked_by FROM jobs WHERE status='RUNNING';"
+
+# kill that container (the first 12 characters of locked_by are the container id)
+docker kill <container-id>
+
+# about 30 seconds later the reaper reclaims the job and another worker finishes it
 docker compose logs -f worker
 ```
 
-Job types are handled by `JobHandler` beans (`SEND_EMAIL`, `ALWAYS_FAIL` are included as demos).
-To add a type, implement `JobHandler` and annotate it with `@Component`.
+The job's attempt history then shows the lost attempt (`Worker lost: lock expired`) followed by a successful attempt on a different worker.
 
-## Job lifecycle
+## API
 
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/jobs` | Submit a job. Optional `Idempotency-Key` header. `201` when created, `200` plus `Idempotent-Replayed: true` for a repeat, `422` if the key was used for a different request |
+| `GET` | `/api/jobs` | List jobs. Filters `status`, `type`; paging `limit`, `offset`; total in the `X-Total-Count` header |
+| `GET` | `/api/jobs/{id}` | Job details |
+| `GET` | `/api/jobs/{id}/attempts` | Every attempt: worker, timing, error |
+| `DELETE` | `/api/jobs/{id}` | Cancel a `PENDING` job (`409` if a worker already has it) |
+| `POST` | `/api/jobs/{id}/retry` | Re-queue a `DEAD` job with a fresh attempt budget |
+| `GET` | `/api/stats` | Counts per status, jobs finished in the last minute, longest wait |
+| `POST` | `/api/schedules` | Create a recurring job (5- or 6-field cron, or `@daily` style macros; IANA time zone) |
+| `GET` | `/api/schedules`, `/api/schedules/{id}` | List or read schedules |
+| `POST` | `/api/schedules/{id}/pause`, `/resume`, `/trigger` | Pause, resume, or run once now |
+| `DELETE` | `/api/schedules/{id}` | Delete a schedule (jobs it already created are kept) |
+| `GET` | `/actuator/health`, `/actuator/prometheus` | Health and metrics |
+
+Submit body: `type` and `payload` are required; `priority` (1-10, default 5), `delaySeconds` (default 0) and `maxAttempts` (1-20, default 5) are optional. Errors are returned as RFC 7807 problem details.
+
+## How it works
+
+### Claiming jobs without double execution
+
+```sql
+UPDATE jobs
+SET status = 'RUNNING', locked_by = :worker, locked_at = now(), attempts = attempts + 1
+WHERE id = (
+    SELECT id FROM jobs
+    WHERE status = 'PENDING' AND run_at <= now()
+    ORDER BY priority DESC, run_at
+    FOR UPDATE SKIP LOCKED
+    LIMIT 1
+)
+RETURNING *;
 ```
-PENDING --claim--> RUNNING --success--> SUCCEEDED
-                      |
-                      +--failure, attempts left--> PENDING (run_at pushed out by exponential backoff)
-                      +--failure, no attempts left--> DEAD
-                      +--worker vanished (lock older than timeout)--> reaper: PENDING, or DEAD if no attempts left
-```
 
-- Backoff: `base * 2^(attempt-1)`, capped, with +/-25% jitter (`jobqueue.worker.backoff-*`).
-- Delivery is **at-least-once**: if a worker dies mid-job the job runs again, so handlers should be idempotent.
-- State changes are guarded by `locked_by`, so a slow worker that was already reclaimed cannot overwrite the new owner's result.
-- `GET /api/jobs/{id}/attempts` shows every try with worker, timing and error.
-- `FAILED` is a legacy status from phase 2 and is no longer used.
+`SKIP LOCKED` makes a worker pass over rows another worker is already claiming instead of waiting for them. A partial index on pending jobs keeps the lookup cheap. A concurrency test runs 10 threads against 500 jobs and asserts every job is claimed exactly once.
 
-## Crash recovery demo
+### Retries, dead letters and lost workers
 
-```bash
-# 1. submit a 20 s job, 2. see which container runs it, 3. kill that container, 4. watch it get reclaimed
-curl -X POST localhost:8081/api/jobs -H "Content-Type: application/json" -d '{"type":"SLOW","payload":{"seconds":20}}'
-docker compose exec postgres psql -U jobqueue -c "SELECT id, status, locked_by, attempts FROM jobs WHERE status='RUNNING';"
-docker kill <first 12 chars of locked_by>
-docker compose logs -f worker      # ~30 s later: "Reaper reclaimed 1 abandoned job(s)", then it succeeds on attempt 2
-```
+- A failed attempt goes back to `PENDING` with `run_at` pushed out by `base * 2^(attempt-1)` (capped), plus +/-25% random jitter so retries do not arrive in a burst. After `maxAttempts` the job becomes `DEAD`.
+- A scheduled **reaper** (one per worker container, safe thanks to `SKIP LOCKED`) finds `RUNNING` jobs whose lock is older than the timeout and re-queues them, or dead-letters them if no attempts are left. The open attempt record is closed as failed.
+- Every status change is guarded by `locked_by`. If a slow worker was already reclaimed, its late result updates zero rows and cannot overwrite the new owner's.
+
+### Recurring jobs
+
+Each worker container checks for due schedules every few seconds. The check locks due schedule rows with `SKIP LOCKED`, inserts the job and moves `next_run_at` forward **in a single transaction**, so a due run is fired by exactly one container and never half-applied. Runs missed while workers were down are not replayed: one job is created and the next run is the first occurrence after now. A test fires one due schedule from four threads at once and asserts exactly one job is created.
+
+### Idempotency keys
+
+The key is stored on the job behind a unique index, and the insert uses `ON CONFLICT DO NOTHING`, so simultaneous requests with one key create exactly one job. The request is fingerprinted (SHA-256 of the canonical JSON after defaults are applied), so reordered JSON fields count as the same request while a different request under the same key is rejected with `422`.
+
+### Delivery guarantees
+
+Execution is **at-least-once**: if a worker dies after doing the work but before recording it, the job runs again, so handlers should be idempotent. Idempotency keys give effectively-once *submission*.
 
 ## Benchmarks
 
-`loadtest/run-loadtest.ps1` (PowerShell) bulk-inserts a batch of jobs, scales the worker containers
-(1, 3, 6 by default, 4 threads each) and measures how long they take to drain the queue.
-Throughput comes from timestamps stored in Postgres, and the script also reports duplicate
-executions (must be 0) and failures.
-
-```powershell
-.\loadtest\run-loadtest.ps1 -Type NOOP -Jobs 5000        # queue overhead only
-.\loadtest\run-loadtest.ps1 -Type SEND_EMAIL -Jobs 1000  # ~300 ms of simulated work per job
-```
-
-It empties the `jobs` tables first. Results are saved to `loadtest/results-<type>.md`.
-
-## Tests
-
-```bash
-mvn test        # uses Testcontainers, Docker must be running
-```
-
-## Roadmap
-- [x] Phase 1: schema, REST API, Docker Compose
-- [x] Phase 2: worker + SKIP LOCKED claiming
-- [x] Phase 3: retries, backoff, dead letters, stuck-job reaper
-- [x] Phase 4: cancel, retry, stats, filtering and paging, CORS, dashboard frontend
-- [x] CI (GitHub Actions) and load-test script
-- [ ] Phase 5: recurring (cron) jobs, idempotency keys
-- [ ] Phase 6: metrics (Prometheus / Grafana)
-
-
-## Benchmark results
-
-All services (PostgreSQL 16, API, workers) ran on one laptop in Docker Desktop with 4 CPUs and about 3.7 GB RAM, so treat these as relative numbers, not absolute capacity. Each worker container runs 4 polling threads. Reproduce with `loadtest/run-loadtest.ps1`.
+Everything (PostgreSQL 16, API, workers, load generator) ran on one laptop in Docker Desktop with 4 CPUs and about 3.7 GB of RAM, so treat these as relative numbers, not absolute capacity. Each worker container runs 4 polling threads. Reproduce with `loadtest/run-loadtest.ps1` (PowerShell; it empties the jobs tables first).
 
 **Queue overhead** (`NOOP` jobs, 5,000 per run):
 
@@ -122,7 +185,7 @@ All services (PostgreSQL 16, API, workers) ran on one laptop in Docker Desktop w
 | 3 | 12 | 5000 | 10.25 | 487.6 | 0 | 0 |
 | 6 | 24 | 5000 | 27.56 | 181.4 | 0 | 0 |
 
-**Scaling with real work** (`SEND_EMAIL`, about 300 ms simulated work per job, 1,000 per run):
+**Scaling with real work** (`SEND_EMAIL`, about 300 ms of simulated work per job, 1,000 per run):
 
 | Workers | Threads | Jobs | Seconds | Jobs/sec | Duplicate attempts | Failed |
 |---|---|---|---|---|---|---|
@@ -130,16 +193,88 @@ All services (PostgreSQL 16, API, workers) ran on one laptop in Docker Desktop w
 | 2 | 8 | 1000 | 45.94 | 21.8 | 0 | 0 |
 | 4 | 16 | 1000 | 30.07 | 33.3 | 0 | 0 |
 
-What the numbers show:
-- **Correctness under load:** no job was executed twice across 18,000 job runs, with up to 24 threads claiming jobs at the same time.
-- **Queue overhead:** one container processes about 320 no-op jobs/sec and three reach about 490. At six containers throughput drops, most likely because seven JVMs plus Postgres compete for 4 CPUs. That reflects the test machine, not the design.
+- **Correctness under load:** no job was attempted twice across 18,000 job runs, with up to 24 threads claiming jobs at the same time.
+- **Queue overhead:** one container processes about 320 no-op jobs/sec and three reach about 490. At six containers throughput drops, most likely because seven JVMs plus PostgreSQL compete for 4 CPUs. That reflects the test machine, not the design, but I have not isolated the cause.
 - **Scaling:** with I/O-bound jobs, throughput grows from 12.1 to 33.3 jobs/sec (2.75x) going from 1 to 4 containers. Each added container helps a bit less because all of them share the same CPUs and database.
 
-## Dashboard
+## Monitoring
 
-A React + Vite dashboard lives in `frontend/`. It shows live queue stats, a paged and filterable job list, per-job attempt history, and Cancel / Retry buttons.
+Prometheus scrapes the API and every worker container (new containers are discovered automatically); Grafana ships with a provisioned **JobQueue overview** dashboard.
 
-    cd frontend
-    npm install
-    npm run dev    # http://localhost:5173, proxies /api to localhost:8081
+| Metric | Meaning |
+|---|---|
+| `jobqueue_jobs{status}` | Jobs per status (gauge, read from PostgreSQL by the API) |
+| `jobqueue_oldest_pending_age_seconds` | Wait of the longest-waiting runnable job |
+| `jobqueue_job_duration_seconds` | Time inside the handler, by `type` and `outcome` (histogram) |
+| `jobqueue_job_queue_wait_seconds` | Time between a job becoming due and a worker picking it up (histogram) |
+| `jobqueue_job_retries_total`, `jobqueue_job_dead_total` | Retries scheduled and jobs dead-lettered |
+| `jobqueue_reaper_reclaimed_total` | Jobs recovered from lost workers |
+| `jobqueue_schedules_fired_total` | Recurring-schedule runs |
 
+## Configuration
+
+Set as environment variables (see `docker-compose.yml`).
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DB_URL`, `DB_USER`, `DB_PASSWORD` | local Postgres | Database connection |
+| `JOBQUEUE_WORKER_ENABLED` | `false` | Run worker threads, reaper and scheduler in this process |
+| `JOBQUEUE_WORKER_CONCURRENCY` | `2` (compose: `4`) | Polling threads per container |
+| `JOBQUEUE_WORKER_POLL_INTERVAL_MS` | `500` | Sleep between polls when the queue is empty |
+| `JOBQUEUE_WORKER_BACKOFF_BASE_SECONDS`, `..._MAX_SECONDS` | `2`, `300` | First retry delay and its cap |
+| `JOBQUEUE_WORKER_LOCK_TIMEOUT_SECONDS` | `120` (compose: `30`) | A running job locked longer than this is considered abandoned. Must exceed your slowest job |
+| `JOBQUEUE_WORKER_REAPER_INTERVAL_MS` | `15000` (compose: `5000`) | How often the reaper runs |
+| `JOBQUEUE_WORKER_SCHEDULER_INTERVAL_MS` | `5000` | How often schedules are checked |
+| `JOBQUEUE_CORS_ALLOWED_ORIGINS` | `localhost` and `127.0.0.1`, any port | Origins allowed to call the API from a browser |
+
+## Tests and CI
+
+```bash
+mvn test        # Docker must be running: integration tests start real PostgreSQL containers
+```
+
+- Unit tests: backoff policy, cron parsing and time zones.
+- Integration tests against PostgreSQL (Testcontainers): the REST API, claiming under concurrency, worker end-to-end (exactly-once, retries, dead letters), retry scheduling and crash recovery, cancel/retry/stats/paging/CORS, recurring schedules (including simultaneous ticks), idempotency keys (including a race), and the metrics endpoint.
+- GitHub Actions runs the whole suite and builds the Docker images on every push.
+
+## Design decisions and limitations
+
+- **PostgreSQL as the queue instead of Kafka or RabbitMQ.** One dependency, transactional, durable, and easy to inspect with SQL. The cost is lower throughput than a dedicated broker, polling latency of up to the poll interval (500 ms by default; `LISTEN/NOTIFY` would reduce it), and table churn that needs vacuuming and eventually archiving or partitioning. Job rows are never deleted today.
+- **At-least-once, not exactly-once, execution.** A worker that dies after finishing the work but before recording it causes a re-run. Handlers need to be idempotent.
+- **No lock heartbeat.** The reaper uses a fixed lock timeout, so a job that legitimately runs longer than the timeout would be run twice. A lease-renewal heartbeat would fix this.
+- **Recurring jobs:** missed runs are not replayed, and a new run can start while the previous one is still running. Schedules cannot fire more often than every 10 seconds.
+- **Idempotency keys never expire** (they live as long as the job row) and are global rather than per client.
+- **Priorities are strict**, so a steady stream of high-priority jobs can starve low-priority ones.
+- **No authentication in the application.** It is meant to sit behind a reverse proxy. CORS is limited to localhost by default.
+- **Benchmarks come from a single laptop** and show relative behaviour only.
+
+## Project structure
+
+```
+src/main/java/com/example/jobqueue/
+  api/        REST controllers, service logic, error handling, CORS
+  domain/     Job, JobAttempt, JobStats, JobStatus
+  repo/       JobRepository (all job SQL)
+  worker/     WorkerLoop, BackoffPolicy, StuckJobReaper, JobHandler and demo handlers
+  schedule/   cron schedules: repository, service, scheduler, controller
+  metrics/    QueueMetrics (Prometheus gauges)
+src/main/resources/db/migration/   Flyway migrations V1-V4
+src/test/java/                     unit and integration tests
+frontend/                          React + Vite dashboard
+monitoring/                        Prometheus config, Grafana provisioning and dashboard
+loadtest/                          load-test script and results
+.github/workflows/ci.yml           CI pipeline
+```
+
+## Roadmap
+
+- [x] REST API, PostgreSQL schema, Docker Compose
+- [x] Workers with `SKIP LOCKED` claiming
+- [x] Retries with backoff, dead letters, stuck-job reaper
+- [x] Cancel, retry, stats, filtering and paging, CORS, dashboard
+- [x] CI and load tests
+- [x] Recurring (cron) jobs
+- [x] Idempotency keys
+- [x] Prometheus metrics and Grafana dashboard
+- [ ] Deployment with a public demo
+- [ ] Lock heartbeat, `LISTEN/NOTIFY` wake-ups, data retention
