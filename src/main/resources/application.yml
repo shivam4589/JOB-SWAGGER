@@ -1,3 +1,7 @@
+server:
+  # Hosting platforms (Render, Railway, ...) tell the app which port to use through PORT.
+  port: ${PORT:8080}
+
 spring:
   application:
     name: jobqueue
