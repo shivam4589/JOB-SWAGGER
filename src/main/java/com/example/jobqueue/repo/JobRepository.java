@@ -357,6 +357,57 @@ public class JobRepository {
                 .single();
     }
 
+    // ------------------------------------------------ heartbeat, wake-ups, retention
+
+    /**
+     * Heartbeat: the worker that is running this job proves it is still alive by refreshing the lock time.
+     * Returns 0 if the job is no longer this worker's (for example the reaper already reclaimed it).
+     */
+    public int touchLock(UUID id, String workerId) {
+        return jdbc.sql("""
+                UPDATE jobs SET locked_at = now()
+                WHERE id = :id AND status = 'RUNNING' AND locked_by = :worker
+                """)
+                .param("id", id)
+                .param("worker", workerId)
+                .update();
+    }
+
+    /** When the earliest waiting job becomes due, or empty if nothing is waiting. */
+    public Optional<Instant> nextPendingRunAt() {
+        List<Instant> result = jdbc.sql("SELECT min(run_at) FROM jobs WHERE status = 'PENDING'")
+                .query((rs, i) -> {
+                    Timestamp ts = rs.getTimestamp(1);
+                    return ts == null ? null : ts.toInstant();
+                })
+                .list();
+        return result.isEmpty() ? Optional.empty() : Optional.ofNullable(result.get(0));
+    }
+
+    /**
+     * Deletes up to batchSize finished jobs that are older than the retention limits (their attempt history goes
+     * with them). SUCCEEDED jobs expire after succeededDays; DEAD / CANCELLED jobs after otherDays.
+     * Jobs that are still PENDING or RUNNING are never touched.
+     */
+    public int deleteExpired(int succeededDays, int otherDays, int batchSize) {
+        return jdbc.sql("""
+                DELETE FROM jobs
+                WHERE id IN (
+                    SELECT id FROM jobs
+                    WHERE (status = 'SUCCEEDED' AND updated_at < now() - (:succeededDays * INTERVAL '1 day'))
+                       OR (status IN ('DEAD', 'CANCELLED', 'FAILED')
+                           AND updated_at < now() - (:otherDays * INTERVAL '1 day'))
+                    ORDER BY updated_at
+                    LIMIT :batch
+                    FOR UPDATE SKIP LOCKED
+                )
+                """)
+                .param("succeededDays", succeededDays)
+                .param("otherDays", otherDays)
+                .param("batch", batchSize)
+                .update();
+    }
+
     // ------------------------------------------------------------------- mapping
 
     private Job map(ResultSet rs, int rowNum) throws SQLException {

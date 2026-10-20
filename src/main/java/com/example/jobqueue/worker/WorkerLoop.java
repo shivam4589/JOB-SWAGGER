@@ -21,10 +21,13 @@ import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
 
 /**
- * Polling worker: N threads, each repeatedly claims one job and runs its handler.
- * Delivery is at-least-once: a job can run again if its worker dies, so handlers
- * should be idempotent.
+ * Worker: N threads, each repeatedly claims one job and runs its handler.
+ * Delivery is at-least-once: a job can run again if its worker dies, so handlers should be idempotent.
  * Only created when jobqueue.worker.enabled=true, so the API container stays a pure API.
+ *
+ * When nothing is waiting, a thread sleeps until (a) a LISTEN/NOTIFY wake-up arrives, (b) the earliest waiting job
+ * becomes due (retries and delayed jobs), or (c) a safety timeout passes. Without a LISTEN connection it simply
+ * polls every poll-interval-ms.
  *
  * Metrics (Micrometer, exported to Prometheus):
  *   jobqueue.job.duration    timer, time inside the handler, tags: type, outcome (success / failure)
@@ -38,23 +41,30 @@ public class WorkerLoop {
 
     private static final Logger log = LoggerFactory.getLogger(WorkerLoop.class);
     private static final int MAX_ERROR_LENGTH = 2000;
+    private static final long MIN_IDLE_WAIT_MS = 100;
 
     private final JobRepository repository;
     private final JobHandlerRegistry registry;
     private final WorkerProperties props;
     private final BackoffPolicy backoff;
     private final MeterRegistry meters;
+    private final WakeSignal wake;
+    private final JobNotifier notifier;
+    private final InFlightJobs inFlight;
 
     private ExecutorService executor;
     private volatile boolean running;
 
     public WorkerLoop(JobRepository repository, JobHandlerRegistry registry, WorkerProperties props,
-                      MeterRegistry meters) {
+                      MeterRegistry meters, WakeSignal wake, JobNotifier notifier, InFlightJobs inFlight) {
         this.repository = repository;
         this.registry = registry;
         this.props = props;
         this.backoff = new BackoffPolicy(props.backoffBaseSeconds(), props.backoffMaxSeconds());
         this.meters = meters;
+        this.wake = wake;
+        this.notifier = notifier;
+        this.inFlight = inFlight;
     }
 
     @EventListener(ApplicationReadyEvent.class)
@@ -73,6 +83,7 @@ public class WorkerLoop {
     @PreDestroy
     public void stop() {
         running = false;
+        wake.signal(); // let idle threads notice immediately
         if (executor == null) {
             return;
         }
@@ -91,11 +102,12 @@ public class WorkerLoop {
     private void runLoop(String workerId) {
         while (running) {
             try {
+                long seen = wake.generation(); // read BEFORE looking for work so a wake-up cannot be missed
                 Optional<Job> claimed = repository.claimNext(workerId);
                 if (claimed.isPresent()) {
                     execute(claimed.get(), workerId);
                 } else {
-                    Thread.sleep(props.pollIntervalMs());
+                    idleWait(seen);
                 }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
@@ -113,36 +125,55 @@ public class WorkerLoop {
         }
     }
 
-    private void execute(Job job, String workerId) {
-        recordQueueWait(job);
-        long attemptId = repository.startAttempt(job.id(), workerId);
-
-        Timer.Sample sample = Timer.start(meters);
-        Exception handlerError = null;
-        try {
-            JobHandler handler = registry.find(job.type()).orElseThrow(
-                    () -> new IllegalStateException("No handler registered for job type " + job.type()));
-            handler.handle(job);
-        } catch (Exception e) {
-            if (e instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
+    private void idleWait(long seenGeneration) throws InterruptedException {
+        long waitMs = props.pollIntervalMs();
+        if (notifier.isListening()) {
+            // woken by NOTIFY; otherwise sleep until the earliest waiting job is due, or the safety timeout
+            waitMs = Math.max(props.pollIntervalMs(), props.listenSafetyPollMs());
+            Optional<Instant> nextDue = repository.nextPendingRunAt();
+            if (nextDue.isPresent()) {
+                long untilDue = Duration.between(Instant.now(), nextDue.get()).toMillis();
+                waitMs = Math.min(waitMs, Math.max(MIN_IDLE_WAIT_MS, untilDue));
             }
-            handlerError = e;
         }
-        // Measure before touching the database, so anything that sees the new job status also sees the measurement.
-        sample.stop(durationTimer(job.type(), handlerError == null ? "success" : "failure"));
+        wake.awaitChange(seenGeneration, waitMs);
+    }
 
-        if (handlerError == null) {
-            repository.finishAttempt(attemptId, true, null);
-            if (repository.markSucceeded(job.id(), workerId) == 0) {
-                log.warn("Job {} finished but this worker no longer holds its lock (reclaimed by the reaper?)",
-                        job.id());
-            } else {
-                log.info("Job {} ({}) succeeded on attempt {} by {}",
-                        job.id(), job.type(), job.attempts(), workerId);
+    private void execute(Job job, String workerId) {
+        inFlight.add(job.id(), workerId); // from now on the heartbeat keeps this job's lock fresh
+        try {
+            recordQueueWait(job);
+            long attemptId = repository.startAttempt(job.id(), workerId);
+
+            Timer.Sample sample = Timer.start(meters);
+            Exception handlerError = null;
+            try {
+                JobHandler handler = registry.find(job.type()).orElseThrow(
+                        () -> new IllegalStateException("No handler registered for job type " + job.type()));
+                handler.handle(job);
+            } catch (Exception e) {
+                if (e instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+                handlerError = e;
             }
-        } else {
-            handleFailure(job, workerId, attemptId, truncate(handlerError.toString()));
+            // Measure before touching the database, so anything that sees the new job status also sees the measurement.
+            sample.stop(durationTimer(job.type(), handlerError == null ? "success" : "failure"));
+
+            if (handlerError == null) {
+                repository.finishAttempt(attemptId, true, null);
+                if (repository.markSucceeded(job.id(), workerId) == 0) {
+                    log.warn("Job {} finished but this worker no longer holds its lock (reclaimed by the reaper?)",
+                            job.id());
+                } else {
+                    log.info("Job {} ({}) succeeded on attempt {} by {}",
+                            job.id(), job.type(), job.attempts(), workerId);
+                }
+            } else {
+                handleFailure(job, workerId, attemptId, truncate(handlerError.toString()));
+            }
+        } finally {
+            inFlight.remove(job.id());
         }
     }
 

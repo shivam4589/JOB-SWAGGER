@@ -743,8 +743,8 @@ export default function App() {
           <button className={view === 'schedules' ? 'nav-item active' : 'nav-item'} onClick={() => setView('schedules')}><Icon name="calendar" size={18} />Schedules</button>
         </nav>
         <div className="sidebar-bottom">
-          <div className="api-status"><span className={`connection-dot ${error ? 'offline' : ''}`} /><span><strong>{loading ? 'Connecting...' : error ? 'API unavailable' : 'API connected'}</strong><small>{error ? 'Check your connection' : 'localhost:8081'}</small></span></div>
-          <div className="user-card"><span className="avatar">JD</span><span><strong>Job Dashboard</strong><small>Local environment</small></span><span className="user-menu">...</span></div>
+          <div className="api-status"><span className={`connection-dot ${error ? 'offline' : ''}`} /><span><strong>{loading ? 'Connecting...' : error ? 'API unavailable' : 'API connected'}</strong><small>{error ? 'Check your connection' : window.location.host}</small></span></div>
+          <div className="user-card"><span className="avatar">JD</span><span><strong>Job Dashboard</strong><small>{window.location.hostname === 'localhost' ? 'Local environment' : 'Live demo'}</small></span><span className="user-menu">...</span></div>
         </div>
       </aside>
 
@@ -764,7 +764,7 @@ export default function App() {
                 <button className="button button-primary new-job-button" onClick={() => setSubmitting(true)}><Icon name="plus" size={18} />Create job</button>
               </section>
 
-              {error && <div className="connection-error" role="alert"><Icon name="alert" size={19} /><div><strong>Couldn't load jobs</strong><span>{error} - Check that the API is running on port 8081.</span></div><button className="text-button" onClick={() => refresh(true)}>Try again</button></div>}
+              {error && <div className="connection-error" role="alert"><Icon name="alert" size={19} /><div><strong>Couldn't load jobs</strong><span>{error} - Check that the API is running.</span></div><button className="text-button" onClick={() => refresh(true)}>Try again</button></div>}
 
               {notice && <div className="schedule-note" role="status">{notice}</div>}
 

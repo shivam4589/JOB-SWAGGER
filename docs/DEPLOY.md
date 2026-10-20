@@ -50,6 +50,11 @@ Cost: $0. No credit card is needed for either service at the time of writing; ch
 - Create a job: the browser asks for the admin login; after logging in the job runs and shows as SUCCEEDED.
 - Open the site in a private window: you can look at everything, but creating a job asks for the login.
 
+## About LISTEN/NOTIFY on Neon
+Workers are woken instantly through PostgreSQL LISTEN/NOTIFY. That needs a normal (direct) connection, which is why
+the guide asks for the host **without** `-pooler`. If the connection is not available the app simply falls back to
+polling, so nothing breaks; jobs just start up to a few seconds later.
+
 ## Troubleshooting
 - **Build fails:** open the build log on Render and look at the first error.
 - **Service restarts or says "out of memory":** the free instance has 512 MB. Lower `JOBQUEUE_WORKER_CONCURRENCY` to `1`.

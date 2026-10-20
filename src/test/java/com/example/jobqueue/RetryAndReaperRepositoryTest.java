@@ -127,6 +127,28 @@ class RetryAndReaperRepositoryTest {
     }
 
     @Test
+    void heartbeatKeepsALongRunningJobFromBeingReclaimed() {
+        Job job = newJob(3);
+        repository.claimNext("w1").orElseThrow();
+        makeLockStale(job.id());
+
+        assertThat(repository.touchLock(job.id(), "w1")).isEqualTo(1); // the worker proves it is still alive
+
+        assertThat(repository.reapStuckJobs(60)).isZero();
+        assertThat(repository.findById(job.id()).orElseThrow().status()).isEqualTo(JobStatus.RUNNING);
+    }
+
+    @Test
+    void heartbeatFromAWorkerThatLostTheJobIsIgnored() {
+        Job job = newJob(3);
+        repository.claimNext("ghost").orElseThrow();
+        makeLockStale(job.id());
+        repository.reapStuckJobs(60); // reclaimed
+
+        assertThat(repository.touchLock(job.id(), "ghost")).isZero();
+    }
+
+    @Test
     void lateResultFromReclaimedWorkerIsIgnored() {
         Job job = newJob(3);
         repository.claimNext("ghost").orElseThrow();

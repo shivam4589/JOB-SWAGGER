@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/shivam4589/JOB-SWAGGER/actions/workflows/ci.yml/badge.svg)](https://github.com/shivam4589/JOB-SWAGGER/actions/workflows/ci.yml)
 
+**Live demo: https://job-swagger.onrender.com** (free hosting, so it can take about a minute to wake up after being idle; looking around is public, creating or changing jobs asks for an admin login).
+
 A distributed background-job queue built on **PostgreSQL**, with a **Spring Boot** API, horizontally scalable **worker containers**, a **React dashboard**, and **Prometheus / Grafana** monitoring.
 
 Clients submit jobs over REST. A fleet of worker containers claims them safely (no job is ever handed to two workers), retries failures with exponential backoff, parks hopeless jobs in a dead-letter state, and recovers jobs from workers that crash. Recurring jobs run on cron schedules. Everything runs with one `docker compose up`.
@@ -10,9 +12,11 @@ Clients submit jobs over REST. A fleet of worker containers claims them safely (
 
 - **Safe concurrent claiming**: workers claim jobs with `SELECT ... FOR UPDATE SKIP LOCKED`, so any number of workers can poll one table without blocking each other or running a job twice.
 - **Retries with exponential backoff and jitter**, then a **dead-letter** state after the attempt limit. Dead jobs can be retried manually.
-- **Crash recovery**: a reaper returns jobs from lost workers to the queue. Verified by killing a worker container mid-job.
+- **Crash recovery with a lock heartbeat**: workers keep refreshing the lock of the jobs they run, so a long job is never mistaken for an abandoned one, while a crashed worker is detected quickly. Verified by killing a worker container mid-job.
+- **Instant wake-ups** through PostgreSQL `LISTEN/NOTIFY`: a new, retried or delayed job starts within milliseconds instead of waiting for the next poll. Polling stays as a fallback.
 - **Recurring jobs**: cron schedules (5- or 6-field cron, time zones), fired exactly once even with many worker containers ticking at the same time.
 - **Idempotency keys**: repeat a submit with the same `Idempotency-Key` and get the original job back instead of a duplicate.
+- **Data retention**: old finished jobs (and their attempt history) are deleted automatically in small batches.
 - **Priorities, delayed jobs, cancellation**, and a full per-attempt audit trail (worker, timing, error).
 - **React dashboard**: live stats, paged and filterable job list, job details with attempts, create/cancel/retry, schedules page.
 - **Observability**: Prometheus metrics (queue depth, throughput, duration and queue-wait percentiles, retries, dead letters) and a provisioned Grafana dashboard.
@@ -28,6 +32,9 @@ flowchart LR
     W1[Worker container 1] --> DB
     W2[Worker container 2] --> DB
     WN[Worker container N] --> DB
+    DB -. NOTIFY .-> W1
+    DB -. NOTIFY .-> W2
+    DB -. NOTIFY .-> WN
     P[Prometheus] -. scrapes .-> API
     P -. scrapes .-> W1
     P -. scrapes .-> W2
@@ -35,7 +42,7 @@ flowchart LR
     G[Grafana] --> P
 ```
 
-The API and the workers are the same Spring Boot application started in different modes (`JOBQUEUE_WORKER_ENABLED`). PostgreSQL is the only shared state: it is the queue, the audit log and the lock manager.
+The API and the workers are the same Spring Boot application started in different modes (`JOBQUEUE_WORKER_ENABLED`). PostgreSQL is the only shared state: it is the queue, the audit log, the lock manager and the wake-up channel.
 
 ### Job lifecycle
 
@@ -115,7 +122,7 @@ docker kill <container-id>
 docker compose logs -f worker
 ```
 
-The job's attempt history then shows the lost attempt (`Worker lost: lock expired`) followed by a successful attempt on a different worker.
+The job's attempt history then shows the lost attempt (`Worker lost: lock expired`) followed by a successful attempt on a different worker. A healthy worker running the same job for much longer than the lock timeout is *not* disturbed, because its heartbeat keeps the lock fresh.
 
 ## API
 
@@ -134,7 +141,7 @@ The job's attempt history then shows the lost attempt (`Worker lost: lock expire
 | `DELETE` | `/api/schedules/{id}` | Delete a schedule (jobs it already created are kept) |
 | `GET` | `/actuator/health`, `/actuator/prometheus` | Health and metrics |
 
-Submit body: `type` and `payload` are required; `priority` (1-10, default 5), `delaySeconds` (default 0) and `maxAttempts` (1-20, default 5) are optional. Errors are returned as RFC 7807 problem details.
+Submit body: `type` and `payload` are required; `priority` (1-10, default 5), `delaySeconds` (default 0) and `maxAttempts` (1-20, default 5) are optional. Errors are returned as RFC 7807 problem details. When `JOBQUEUE_ADMIN_PASSWORD` is set, every `POST`, `PUT`, `PATCH` and `DELETE` under `/api` needs HTTP Basic credentials, while reading stays open (this is how the public demo is protected).
 
 ## How it works
 
@@ -158,8 +165,12 @@ RETURNING *;
 ### Retries, dead letters and lost workers
 
 - A failed attempt goes back to `PENDING` with `run_at` pushed out by `base * 2^(attempt-1)` (capped), plus +/-25% random jitter so retries do not arrive in a burst. After `maxAttempts` the job becomes `DEAD`.
-- A scheduled **reaper** (one per worker container, safe thanks to `SKIP LOCKED`) finds `RUNNING` jobs whose lock is older than the timeout and re-queues them, or dead-letters them if no attempts are left. The open attempt record is closed as failed.
-- Every status change is guarded by `locked_by`. If a slow worker was already reclaimed, its late result updates zero rows and cannot overwrite the new owner's.
+- While a worker runs a job, a **heartbeat** refreshes the job's `locked_at` every few seconds. A scheduled **reaper** (one per worker container, safe thanks to `SKIP LOCKED`) re-queues `RUNNING` jobs whose lock has gone stale for longer than the lock timeout, or dead-letters them if no attempts are left. A crashed worker stops refreshing, so it is detected after the timeout; a slow but healthy job is not. The open attempt record of a reclaimed job is closed as failed.
+- Every status change is guarded by `locked_by`. If a worker was reclaimed anyway, its late result updates zero rows and cannot overwrite the new owner's.
+
+### Instant wake-ups
+
+Database triggers send `NOTIFY jobqueue_jobs` when a job is inserted or goes back to `PENDING`. Each worker container keeps one dedicated connection that `LISTEN`s on that channel and wakes its idle threads. An idle thread otherwise sleeps until the earliest waiting job is due (found with one cheap indexed query), so retries and delayed jobs start on time without busy polling; a longer safety timeout covers anything missed. If the `LISTEN` connection cannot be made (for example behind a transaction-mode connection pooler) or drops, workers fall back to plain polling and the listener keeps retrying. A test sets the poll interval to 30 seconds and still expects jobs to finish within seconds.
 
 ### Recurring jobs
 
@@ -167,7 +178,11 @@ Each worker container checks for due schedules every few seconds. The check lock
 
 ### Idempotency keys
 
-The key is stored on the job behind a unique index, and the insert uses `ON CONFLICT DO NOTHING`, so simultaneous requests with one key create exactly one job. The request is fingerprinted (SHA-256 of the canonical JSON after defaults are applied), so reordered JSON fields count as the same request while a different request under the same key is rejected with `422`.
+The key is stored on the job behind a unique index, and the insert uses `ON CONFLICT DO NOTHING`, so simultaneous requests with one key create exactly one job. The request is fingerprinted (SHA-256 of the canonical JSON after defaults are applied), so reordered JSON fields count as the same request while a different request under the same key is rejected with `422`. Keys are remembered as long as their job exists, so they expire when the retention cleanup deletes the job.
+
+### Data retention
+
+A background task deletes finished jobs older than the configured limits (7 days for `SUCCEEDED`, 30 days for `DEAD` and `CANCELLED` by default), oldest first, in batches of 1,000 using `SKIP LOCKED`. Attempt history is removed together with its job; `PENDING` and `RUNNING` jobs are never touched. This keeps the table small, which also matters on small hosted databases.
 
 ### Delivery guarantees
 
@@ -175,7 +190,7 @@ Execution is **at-least-once**: if a worker dies after doing the work but before
 
 ## Benchmarks
 
-Everything (PostgreSQL 16, API, workers, load generator) ran on one laptop in Docker Desktop with 4 CPUs and about 3.7 GB of RAM, so treat these as relative numbers, not absolute capacity. Each worker container runs 4 polling threads. Reproduce with `loadtest/run-loadtest.ps1` (PowerShell; it empties the jobs tables first).
+Everything (PostgreSQL 16, API, workers, load generator) ran on one laptop in Docker Desktop with 4 CPUs and about 3.7 GB of RAM, so treat these as relative numbers, not absolute capacity. Each worker container runs 4 polling threads. Reproduce with `loadtest/run-loadtest.ps1` (PowerShell; it empties the jobs tables first). These numbers were measured before the heartbeat, `LISTEN/NOTIFY` and retention changes were added.
 
 **Queue overhead** (`NOOP` jobs, 5,000 per run):
 
@@ -209,6 +224,8 @@ Prometheus scrapes the API and every worker container (new containers are discov
 | `jobqueue_job_queue_wait_seconds` | Time between a job becoming due and a worker picking it up (histogram) |
 | `jobqueue_job_retries_total`, `jobqueue_job_dead_total` | Retries scheduled and jobs dead-lettered |
 | `jobqueue_reaper_reclaimed_total` | Jobs recovered from lost workers |
+| `jobqueue_heartbeat_lost_total` | Heartbeats for jobs a worker no longer owned |
+| `jobqueue_retention_deleted_total` | Old jobs deleted by the retention cleanup |
 | `jobqueue_schedules_fired_total` | Recurring-schedule runs |
 
 ## Configuration
@@ -217,15 +234,27 @@ Set as environment variables (see `docker-compose.yml`).
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `DB_URL`, `DB_USER`, `DB_PASSWORD` | local Postgres | Database connection |
-| `JOBQUEUE_WORKER_ENABLED` | `false` | Run worker threads, reaper and scheduler in this process |
+| `DB_URL`, `DB_USER`, `DB_PASSWORD` | local Postgres | Database connection (use a direct, non-pooled connection so `LISTEN` works) |
+| `PORT` | `8080` | HTTP port (hosting platforms set this) |
+| `JOBQUEUE_WORKER_ENABLED` | `false` | Run worker threads, reaper, scheduler, heartbeat and retention in this process |
 | `JOBQUEUE_WORKER_CONCURRENCY` | `2` (compose: `4`) | Polling threads per container |
-| `JOBQUEUE_WORKER_POLL_INTERVAL_MS` | `500` | Sleep between polls when the queue is empty |
+| `JOBQUEUE_WORKER_POLL_INTERVAL_MS` | `500` | Sleep between polls when the queue is empty and `LISTEN` is not connected |
+| `JOBQUEUE_WORKER_LISTEN_ENABLED` | `true` | Wake workers through `LISTEN/NOTIFY` |
+| `JOBQUEUE_WORKER_LISTEN_SAFETY_POLL_MS` | `5000` | Longest an idle worker sleeps while `LISTEN` is connected |
 | `JOBQUEUE_WORKER_BACKOFF_BASE_SECONDS`, `..._MAX_SECONDS` | `2`, `300` | First retry delay and its cap |
-| `JOBQUEUE_WORKER_LOCK_TIMEOUT_SECONDS` | `120` (compose: `30`) | A running job locked longer than this is considered abandoned. Must exceed your slowest job |
+| `JOBQUEUE_WORKER_LOCK_TIMEOUT_SECONDS` | `120` (compose: `30`) | A running job whose lock was not refreshed for this long is considered abandoned |
+| `JOBQUEUE_WORKER_HEARTBEAT_INTERVAL_MS` | `10000` | How often running jobs' locks are refreshed (keep well below half the lock timeout) |
 | `JOBQUEUE_WORKER_REAPER_INTERVAL_MS` | `15000` (compose: `5000`) | How often the reaper runs |
 | `JOBQUEUE_WORKER_SCHEDULER_INTERVAL_MS` | `5000` | How often schedules are checked |
+| `JOBQUEUE_RETENTION_ENABLED` | `true` | Delete old finished jobs automatically |
+| `JOBQUEUE_RETENTION_SUCCEEDED_DAYS`, `..._FAILED_DAYS` | `7`, `30` | How long `SUCCEEDED`, and `DEAD` / `CANCELLED`, jobs are kept |
+| `JOBQUEUE_RETENTION_INTERVAL_MINUTES`, `..._BATCH_SIZE` | `60`, `1000` | Cleanup frequency and batch size |
+| `JOBQUEUE_ADMIN_USER`, `JOBQUEUE_ADMIN_PASSWORD` | unset | When the password is set, changes under `/api` need HTTP Basic login (reading stays open) |
 | `JOBQUEUE_CORS_ALLOWED_ORIGINS` | `localhost` and `127.0.0.1`, any port | Origins allowed to call the API from a browser |
+
+## Deployment
+
+The live demo runs as a single container (`Dockerfile.deploy`: dashboard + API + workers) on Render's free tier with a free Neon PostgreSQL database. Step-by-step instructions, including the environment variables, are in [`docs/DEPLOY.md`](docs/DEPLOY.md). The free service sleeps when idle, so background work only runs while it is awake.
 
 ## Tests and CI
 
@@ -234,35 +263,41 @@ mvn test        # Docker must be running: integration tests start real PostgreSQ
 ```
 
 - Unit tests: backoff policy, cron parsing and time zones.
-- Integration tests against PostgreSQL (Testcontainers): the REST API, claiming under concurrency, worker end-to-end (exactly-once, retries, dead letters), retry scheduling and crash recovery, cancel/retry/stats/paging/CORS, recurring schedules (including simultaneous ticks), idempotency keys (including a race), and the metrics endpoint.
+- Integration tests against PostgreSQL (Testcontainers): the REST API, claiming under concurrency, worker end-to-end (exactly-once, retries, dead letters), retry scheduling and crash recovery, the lock heartbeat (a job longer than the lock timeout runs once), `LISTEN/NOTIFY` wake-ups, data retention, cancel/retry/stats/paging/CORS, recurring schedules (including simultaneous ticks), idempotency keys (including a race), the admin login filter, and the metrics endpoint.
 - GitHub Actions runs the whole suite and builds the Docker images on every push.
 
 ## Design decisions and limitations
 
-- **PostgreSQL as the queue instead of Kafka or RabbitMQ.** One dependency, transactional, durable, and easy to inspect with SQL. The cost is lower throughput than a dedicated broker, polling latency of up to the poll interval (500 ms by default; `LISTEN/NOTIFY` would reduce it), and table churn that needs vacuuming and eventually archiving or partitioning. Job rows are never deleted today.
+- **PostgreSQL as the queue instead of Kafka or RabbitMQ.** One dependency, transactional, durable, and easy to inspect with SQL. The cost is lower throughput than a dedicated broker and table churn from frequent updates, which relies on autovacuum and the retention cleanup.
 - **At-least-once, not exactly-once, execution.** A worker that dies after finishing the work but before recording it causes a re-run. Handlers need to be idempotent.
-- **No lock heartbeat.** The reaper uses a fixed lock timeout, so a job that legitimately runs longer than the timeout would be run twice. A lease-renewal heartbeat would fix this.
+- **Running jobs cannot be cancelled.** Cancel only works while a job is `PENDING`; stopping a handler mid-run would need cooperative cancellation inside each handler.
+- **`LISTEN/NOTIFY` needs a direct database connection.** Behind a transaction-mode pooler it cannot work and the workers fall back to polling, so jobs start a little later but nothing breaks.
 - **Recurring jobs:** missed runs are not replayed, and a new run can start while the previous one is still running. Schedules cannot fire more often than every 10 seconds.
-- **Idempotency keys never expire** (they live as long as the job row) and are global rather than per client.
+- **Idempotency keys are global** rather than per client, and are forgotten when retention deletes the job.
+- **Retention deletes data by design.** Raise the limits (or disable it) if you need a longer history.
 - **Priorities are strict**, so a steady stream of high-priority jobs can starve low-priority ones.
-- **No authentication in the application.** It is meant to sit behind a reverse proxy. CORS is limited to localhost by default.
+- **Authentication is minimal.** There is one optional admin login for write requests, no users or roles. CORS is limited to localhost by default.
 - **Benchmarks come from a single laptop** and show relative behaviour only.
 
 ## Project structure
 
 ```
 src/main/java/com/example/jobqueue/
-  api/        REST controllers, service logic, error handling, CORS
+  api/        REST controllers, service logic, admin login filter, error handling, CORS
   domain/     Job, JobAttempt, JobStats, JobStatus
   repo/       JobRepository (all job SQL)
-  worker/     WorkerLoop, BackoffPolicy, StuckJobReaper, JobHandler and demo handlers
+  worker/     WorkerLoop, WakeSignal, JobNotifier, LockHeartbeat, StuckJobReaper, BackoffPolicy, JobHandler and demo handlers
   schedule/   cron schedules: repository, service, scheduler, controller
+  retention/  cleanup of old finished jobs
   metrics/    QueueMetrics (Prometheus gauges)
-src/main/resources/db/migration/   Flyway migrations V1-V4
+src/main/resources/db/migration/   Flyway migrations V1-V5
 src/test/java/                     unit and integration tests
 frontend/                          React + Vite dashboard
 monitoring/                        Prometheus config, Grafana provisioning and dashboard
 loadtest/                          load-test script and results
+docs/DEPLOY.md                     free deployment guide (Render + Neon)
+Dockerfile, docker-compose.yml     local development
+Dockerfile.deploy                  single-container image for hosting
 .github/workflows/ci.yml           CI pipeline
 ```
 
@@ -276,5 +311,6 @@ loadtest/                          load-test script and results
 - [x] Recurring (cron) jobs
 - [x] Idempotency keys
 - [x] Prometheus metrics and Grafana dashboard
-- [ ] Deployment with a public demo
-- [ ] Lock heartbeat, `LISTEN/NOTIFY` wake-ups, data retention
+- [x] Public demo (Render + Neon free tier)
+- [x] Lock heartbeat, `LISTEN/NOTIFY` wake-ups, data retention
+- [ ] Ideas: cooperative cancellation of running jobs, per-job-type concurrency limits, job results, per-client API keys
