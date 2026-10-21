@@ -140,7 +140,8 @@ public class WorkerLoop {
     }
 
     private void execute(Job job, String workerId) {
-        inFlight.add(job.id(), workerId); // from now on the heartbeat keeps this job's lock fresh
+        // from now on the heartbeat keeps this job's lock fresh and can interrupt this thread to cancel the job
+        InFlightJobs.Entry entry = inFlight.add(job.id(), workerId);
         try {
             recordQueueWait(job);
             long attemptId = repository.startAttempt(job.id(), workerId);
@@ -152,15 +153,21 @@ public class WorkerLoop {
                         () -> new IllegalStateException("No handler registered for job type " + job.type()));
                 handler.handle(job);
             } catch (Exception e) {
-                if (e instanceof InterruptedException) {
-                    Thread.currentThread().interrupt();
-                }
                 handlerError = e;
             }
+
+            boolean cancelRequested = entry.cancelRequested();
+            if (cancelRequested) {
+                Thread.interrupted(); // the interrupt was aimed at the job; it must not leak into this worker thread
+            } else if (handlerError instanceof InterruptedException) {
+                Thread.currentThread().interrupt(); // a real shutdown interrupt: let the loop see it
+            }
+
             // Measure before touching the database, so anything that sees the new job status also sees the measurement.
             sample.stop(durationTimer(job.type(), handlerError == null ? "success" : "failure"));
 
             if (handlerError == null) {
+                // finished normally, even if cancellation arrived in the meantime: the work is done
                 repository.finishAttempt(attemptId, true, null);
                 if (repository.markSucceeded(job.id(), workerId) == 0) {
                     log.warn("Job {} finished but this worker no longer holds its lock (reclaimed by the reaper?)",
@@ -169,11 +176,24 @@ public class WorkerLoop {
                     log.info("Job {} ({}) succeeded on attempt {} by {}",
                             job.id(), job.type(), job.attempts(), workerId);
                 }
+            } else if (cancelRequested) {
+                String note = handlerError instanceof InterruptedException
+                        ? "Cancelled on request"
+                        : "Cancelled on request (the handler failed while stopping: "
+                                + truncate(handlerError.toString()) + ")";
+                repository.finishAttempt(attemptId, false, note);
+                if (repository.markCancelled(job.id(), workerId, note) > 0) {
+                    meters.counter("jobqueue.job.cancelled", "type", job.type()).increment();
+                    log.info("Job {} ({}) was cancelled while running on {}", job.id(), job.type(), workerId);
+                }
             } else {
                 handleFailure(job, workerId, attemptId, truncate(handlerError.toString()));
             }
         } finally {
             inFlight.remove(job.id());
+            if (running) {
+                Thread.interrupted(); // clear any interrupt that was still aimed at this job
+            }
         }
     }
 

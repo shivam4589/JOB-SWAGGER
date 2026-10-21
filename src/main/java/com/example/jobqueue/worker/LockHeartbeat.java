@@ -5,6 +5,7 @@ import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import jakarta.annotation.PreDestroy;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -20,6 +21,9 @@ import org.springframework.stereotype.Component;
  * While a job runs, its worker keeps refreshing the job's lock time. The reaper only reclaims jobs whose lock has
  * gone stale, so a long-running job is never mistaken for an abandoned one, and a crashed worker (which stops
  * refreshing) is still detected after the lock timeout.
+ *
+ * The same round trip carries cancellation requests: the database answers each heartbeat with the job's
+ * cancel_requested flag, and when it is set the handler's thread is interrupted.
  */
 @Component
 @ConditionalOnProperty(name = "jobqueue.worker.enabled", havingValue = "true")
@@ -60,16 +64,20 @@ public class LockHeartbeat {
     }
 
     private void beat() {
-        for (Map.Entry<UUID, String> entry : inFlight.snapshot().entrySet()) {
+        for (Map.Entry<UUID, InFlightJobs.Entry> entry : inFlight.snapshot().entrySet()) {
+            UUID jobId = entry.getKey();
             try {
-                if (repository.touchLock(entry.getKey(), entry.getValue()) == 0) {
+                Optional<Boolean> cancelRequested = repository.heartbeat(jobId, entry.getValue().workerId());
+                if (cancelRequested.isEmpty()) {
                     lostCounter.increment();
                     log.warn("Job {} is no longer locked by {} (reclaimed by the reaper?)",
-                            entry.getKey(), entry.getValue());
+                            jobId, entry.getValue().workerId());
+                } else if (cancelRequested.get() && inFlight.requestCancel(jobId)) {
+                    log.info("Cancellation requested for job {}: interrupting its handler", jobId);
                 }
             } catch (Exception e) {
                 // a database hiccup must not stop the heartbeat; the next beat tries again
-                log.warn("Heartbeat for job {} failed: {}", entry.getKey(), e.toString());
+                log.warn("Heartbeat for job {} failed: {}", jobId, e.toString());
             }
         }
     }

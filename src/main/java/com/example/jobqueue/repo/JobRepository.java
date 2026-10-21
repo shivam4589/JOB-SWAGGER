@@ -249,7 +249,8 @@ public class JobRepository {
                     WHERE finished_at IS NULL AND job_id IN (SELECT id FROM stuck)
                 )
                 UPDATE jobs
-                SET status = CASE WHEN attempts >= max_attempts THEN 'DEAD' ELSE 'PENDING' END,
+                SET status = CASE WHEN cancel_requested THEN 'CANCELLED'
+                                  WHEN attempts >= max_attempts THEN 'DEAD' ELSE 'PENDING' END,
                     last_error = 'Worker lost: lock expired (locked by '
                                  || COALESCE(locked_by, 'unknown') || ')',
                     run_at = now(), locked_by = NULL, locked_at = NULL, updated_at = now()
@@ -317,7 +318,7 @@ public class JobRepository {
     /** DEAD (or legacy FAILED) job back to PENDING with a fresh attempt budget; history stays in job_attempts. */
     public Optional<Job> requeueIfDead(UUID id) {
         return jdbc.sql("""
-                UPDATE jobs SET status = 'PENDING', attempts = 0, run_at = now(),
+                UPDATE jobs SET status = 'PENDING', attempts = 0, cancel_requested = FALSE, run_at = now(),
                     locked_by = NULL, locked_at = NULL, updated_at = now()
                 WHERE id = :id AND status IN ('DEAD', 'FAILED')
                 RETURNING *
@@ -408,6 +409,50 @@ public class JobRepository {
                 .update();
     }
 
+    // ------------------------------------------------ cancelling running jobs
+
+    /** Asks for a RUNNING job to be stopped. The owning worker notices on its next heartbeat. */
+    public Optional<Job> requestCancelIfRunning(UUID id) {
+        return jdbc.sql("""
+                UPDATE jobs SET cancel_requested = TRUE, updated_at = now()
+                WHERE id = :id AND status = 'RUNNING'
+                RETURNING *
+                """)
+                .param("id", id)
+                .query(this::map)
+                .optional();
+    }
+
+    /**
+     * Heartbeat that also reports whether cancellation was requested. Empty means the worker no longer owns the
+     * job; otherwise the value is the cancel_requested flag.
+     */
+    public Optional<Boolean> heartbeat(UUID id, String workerId) {
+        List<Boolean> result = jdbc.sql("""
+                UPDATE jobs SET locked_at = now()
+                WHERE id = :id AND status = 'RUNNING' AND locked_by = :worker
+                RETURNING cancel_requested
+                """)
+                .param("id", id)
+                .param("worker", workerId)
+                .query(Boolean.class)
+                .list();
+        return result.isEmpty() ? Optional.empty() : Optional.of(result.get(0));
+    }
+
+    /** The worker stopped the job because cancellation was requested. */
+    public int markCancelled(UUID id, String workerId, String note) {
+        return jdbc.sql("""
+                UPDATE jobs SET status = 'CANCELLED', last_error = :note,
+                    locked_by = NULL, locked_at = NULL, updated_at = now()
+                WHERE id = :id AND status = 'RUNNING' AND locked_by = :worker
+                """)
+                .param("id", id)
+                .param("worker", workerId)
+                .param("note", note)
+                .update();
+    }
+
     // ------------------------------------------------------------------- mapping
 
     private Job map(ResultSet rs, int rowNum) throws SQLException {
@@ -425,7 +470,8 @@ public class JobRepository {
                     rs.getTimestamp("created_at").toInstant(),
                     rs.getTimestamp("updated_at").toInstant(),
                     rs.getObject("schedule_id", UUID.class),
-                    rs.getString("idempotency_key"));
+                    rs.getString("idempotency_key"),
+                    rs.getBoolean("cancel_requested"));
         } catch (JsonProcessingException e) {
             throw new SQLException("Invalid JSON payload in database", e);
         }

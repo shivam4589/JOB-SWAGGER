@@ -17,7 +17,7 @@ Clients submit jobs over REST. A fleet of worker containers claims them safely (
 - **Recurring jobs**: cron schedules (5- or 6-field cron, time zones), fired exactly once even with many worker containers ticking at the same time.
 - **Idempotency keys**: repeat a submit with the same `Idempotency-Key` and get the original job back instead of a duplicate.
 - **Data retention**: old finished jobs (and their attempt history) are deleted automatically in small batches.
-- **Priorities, delayed jobs, cancellation**, and a full per-attempt audit trail (worker, timing, error).
+- **Priorities, delayed jobs, cancellation of waiting *and running* jobs** (a running job is interrupted at the worker's next heartbeat), and a full per-attempt audit trail (worker, timing, error).
 - **React dashboard**: live stats, paged and filterable job list, job details with attempts, create/cancel/retry, schedules page.
 - **Observability**: Prometheus metrics (queue depth, throughput, duration and queue-wait percentiles, retries, dead letters) and a provisioned Grafana dashboard.
 - **Tested**: unit tests plus integration tests against real PostgreSQL (Testcontainers), including concurrency tests. CI runs everything on every push.
@@ -55,6 +55,7 @@ stateDiagram-v2
     RUNNING --> PENDING: failure with attempts left, after backoff
     RUNNING --> PENDING: worker lost, reaper reclaims
     RUNNING --> DEAD: no attempts left
+    RUNNING --> CANCELLED: cancel requested, worker stops it
     DEAD --> PENDING: manual retry
 ```
 
@@ -132,7 +133,7 @@ The job's attempt history then shows the lost attempt (`Worker lost: lock expire
 | `GET` | `/api/jobs` | List jobs. Filters `status`, `type`; paging `limit`, `offset`; total in the `X-Total-Count` header |
 | `GET` | `/api/jobs/{id}` | Job details |
 | `GET` | `/api/jobs/{id}/attempts` | Every attempt: worker, timing, error |
-| `DELETE` | `/api/jobs/{id}` | Cancel a `PENDING` job (`409` if a worker already has it) |
+| `DELETE` | `/api/jobs/{id}` | Cancel a job. `PENDING`: cancelled at once (`200`). `RUNNING`: cancellation is requested and the worker interrupts the handler within one heartbeat (`202`, the job shows `cancelRequested: true` until it stops). `409` if it already finished |
 | `POST` | `/api/jobs/{id}/retry` | Re-queue a `DEAD` job with a fresh attempt budget |
 | `GET` | `/api/stats` | Counts per status, jobs finished in the last minute, longest wait |
 | `POST` | `/api/schedules` | Create a recurring job (5- or 6-field cron, or `@daily` style macros; IANA time zone) |
@@ -171,6 +172,10 @@ RETURNING *;
 ### Instant wake-ups
 
 Database triggers send `NOTIFY jobqueue_jobs` when a job is inserted or goes back to `PENDING`. Each worker container keeps one dedicated connection that `LISTEN`s on that channel and wakes its idle threads. An idle thread otherwise sleeps until the earliest waiting job is due (found with one cheap indexed query), so retries and delayed jobs start on time without busy polling; a longer safety timeout covers anything missed. If the `LISTEN` connection cannot be made (for example behind a transaction-mode connection pooler) or drops, workers fall back to plain polling and the listener keeps retrying. A test sets the poll interval to 30 seconds and still expects jobs to finish within seconds.
+
+### Cancelling a running job
+
+Cancelling a waiting job is a single `UPDATE`. For a running job the API only sets a `cancel_requested` flag. The database answers every worker heartbeat with that flag; when it is set, the worker interrupts the thread running the handler, closes the attempt as cancelled and marks the job `CANCELLED`. The interrupt is delivered under a lock that checks the thread is still running that job, so a thread that has already moved on is never hit by mistake, and an end-to-end test checks the worker keeps processing jobs afterwards. If a worker dies after the request, the reaper cancels the job instead of re-queuing it. Cancellation is cooperative: handlers that sleep or block on I/O stop immediately, while one that ignores interrupts simply finishes.
 
 ### Recurring jobs
 
@@ -243,7 +248,7 @@ Set as environment variables (see `docker-compose.yml`).
 | `JOBQUEUE_WORKER_LISTEN_SAFETY_POLL_MS` | `5000` | Longest an idle worker sleeps while `LISTEN` is connected |
 | `JOBQUEUE_WORKER_BACKOFF_BASE_SECONDS`, `..._MAX_SECONDS` | `2`, `300` | First retry delay and its cap |
 | `JOBQUEUE_WORKER_LOCK_TIMEOUT_SECONDS` | `120` (compose: `30`) | A running job whose lock was not refreshed for this long is considered abandoned |
-| `JOBQUEUE_WORKER_HEARTBEAT_INTERVAL_MS` | `10000` | How often running jobs' locks are refreshed (keep well below half the lock timeout) |
+| `JOBQUEUE_WORKER_HEARTBEAT_INTERVAL_MS` | `10000` (compose: `3000`) | How often running jobs' locks are refreshed (keep well below half the lock timeout); also how quickly a cancel request reaches a running job |
 | `JOBQUEUE_WORKER_REAPER_INTERVAL_MS` | `15000` (compose: `5000`) | How often the reaper runs |
 | `JOBQUEUE_WORKER_SCHEDULER_INTERVAL_MS` | `5000` | How often schedules are checked |
 | `JOBQUEUE_RETENTION_ENABLED` | `true` | Delete old finished jobs automatically |
@@ -263,14 +268,14 @@ mvn test        # Docker must be running: integration tests start real PostgreSQ
 ```
 
 - Unit tests: backoff policy, cron parsing and time zones.
-- Integration tests against PostgreSQL (Testcontainers): the REST API, claiming under concurrency, worker end-to-end (exactly-once, retries, dead letters), retry scheduling and crash recovery, the lock heartbeat (a job longer than the lock timeout runs once), `LISTEN/NOTIFY` wake-ups, data retention, cancel/retry/stats/paging/CORS, recurring schedules (including simultaneous ticks), idempotency keys (including a race), the admin login filter, and the metrics endpoint.
+- Integration tests against PostgreSQL (Testcontainers): the REST API, claiming under concurrency, worker end-to-end (exactly-once, retries, dead letters), retry scheduling and crash recovery, the lock heartbeat (a job longer than the lock timeout runs once), `LISTEN/NOTIFY` wake-ups, data retention, cancel/retry/stats/paging/CORS, cancelling running jobs, recurring schedules (including simultaneous ticks), idempotency keys (including a race), the admin login filter, and the metrics endpoint.
 - GitHub Actions runs the whole suite and builds the Docker images on every push.
 
 ## Design decisions and limitations
 
 - **PostgreSQL as the queue instead of Kafka or RabbitMQ.** One dependency, transactional, durable, and easy to inspect with SQL. The cost is lower throughput than a dedicated broker and table churn from frequent updates, which relies on autovacuum and the retention cleanup.
 - **At-least-once, not exactly-once, execution.** A worker that dies after finishing the work but before recording it causes a re-run. Handlers need to be idempotent.
-- **Running jobs cannot be cancelled.** Cancel only works while a job is `PENDING`; stopping a handler mid-run would need cooperative cancellation inside each handler.
+- **Cancelling a running job is cooperative.** The worker interrupts the handler thread, so handlers that sleep or block on I/O stop promptly, but a handler that ignores interrupts (for example a tight CPU loop) cannot be stopped and finishes normally. A cancel request takes effect within one heartbeat interval.
 - **`LISTEN/NOTIFY` needs a direct database connection.** Behind a transaction-mode pooler it cannot work and the workers fall back to polling, so jobs start a little later but nothing breaks.
 - **Recurring jobs:** missed runs are not replayed, and a new run can start while the previous one is still running. Schedules cannot fire more often than every 10 seconds.
 - **Idempotency keys are global** rather than per client, and are forgotten when retention deletes the job.
@@ -313,4 +318,5 @@ Dockerfile.deploy                  single-container image for hosting
 - [x] Prometheus metrics and Grafana dashboard
 - [x] Public demo (Render + Neon free tier)
 - [x] Lock heartbeat, `LISTEN/NOTIFY` wake-ups, data retention
-- [ ] Ideas: cooperative cancellation of running jobs, per-job-type concurrency limits, job results, per-client API keys
+- [x] Cooperative cancellation of running jobs
+- [ ] Ideas: per-job-type concurrency limits, job results, per-client API keys

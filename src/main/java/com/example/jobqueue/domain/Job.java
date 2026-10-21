@@ -17,5 +17,6 @@ public record Job(
         Instant createdAt,
         Instant updatedAt,
         UUID scheduleId,
-        String idempotencyKey) {
+        String idempotencyKey,
+        boolean cancelRequested) {
 }

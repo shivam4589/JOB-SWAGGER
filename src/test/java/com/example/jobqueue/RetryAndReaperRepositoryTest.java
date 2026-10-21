@@ -149,6 +149,30 @@ class RetryAndReaperRepositoryTest {
     }
 
     @Test
+    void heartbeatReportsACancellationRequest() {
+        Job job = newJob(3);
+        repository.claimNext("w1").orElseThrow();
+
+        assertThat(repository.heartbeat(job.id(), "w1")).contains(false);
+        assertThat(repository.requestCancelIfRunning(job.id())).isPresent();
+        assertThat(repository.heartbeat(job.id(), "w1")).contains(true);
+        assertThat(repository.heartbeat(job.id(), "someone-else")).isEmpty(); // not the owner
+    }
+
+    @Test
+    void reaperCancelsAnAbandonedJobWhoseCancellationWasRequested() {
+        Job job = newJob(3);
+        repository.claimNext("ghost").orElseThrow();
+        repository.requestCancelIfRunning(job.id());
+        makeLockStale(job.id());
+
+        assertThat(repository.reapStuckJobs(60)).isEqualTo(1);
+
+        // the worker is gone, but the user wanted the job stopped: it must not come back to the queue
+        assertThat(repository.findById(job.id()).orElseThrow().status()).isEqualTo(JobStatus.CANCELLED);
+    }
+
+    @Test
     void lateResultFromReclaimedWorkerIsIgnored() {
         Job job = newJob(3);
         repository.claimNext("ghost").orElseThrow();

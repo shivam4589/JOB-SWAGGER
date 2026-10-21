@@ -462,7 +462,7 @@ function SchedulesPage({ schedules, loading, error, message, onCreate, onAction 
 }
 
 function JobDrawer({ job, attempts, attemptsLoading, attemptsError, actionBusy, actionError, onCancel, onRetry, onClose }) {
-  const canCancel = job.status === 'PENDING'
+  const canCancel = (job.status === 'PENDING' || job.status === 'RUNNING') && !job.cancelRequested
   const canRetry = job.status === 'DEAD' || job.status === 'FAILED'
   return (
     <div className="drawer-backdrop" onMouseDown={(event) => {
@@ -481,6 +481,7 @@ function JobDrawer({ job, attempts, attemptsLoading, attemptsError, actionBusy, 
           </div>
         )}
         {actionError && <div className="form-error" role="alert"><Icon name="alert" size={16} />{actionError}</div>}
+        {job.status === 'RUNNING' && job.cancelRequested && <div className="schedule-note" role="status">Cancellation requested. The worker stops the job at its next heartbeat.</div>}
         {job.lastError && <div className="last-error"><Icon name="alert" size={17} /><div><strong>Last error</strong><p>{job.lastError}</p></div></div>}
         <div className="detail-grid">
           <div><span>Priority</span><strong>{job.priority ?? DASH}</strong></div>
@@ -687,7 +688,7 @@ export default function App() {
 
   async function runAction(kind) {
     if (!selectedJob) return
-    if (kind === 'cancel' && !window.confirm('Cancel this job? It will not run.')) return
+    if (kind === 'cancel' && !window.confirm(selectedJob.status === 'RUNNING' ? 'Ask the worker to stop this running job?' : 'Cancel this job? It will not run.')) return
     setActionBusy(true)
     setActionError('')
     try {

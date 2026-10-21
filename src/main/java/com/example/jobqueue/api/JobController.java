@@ -55,10 +55,17 @@ public class JobController {
         return service.attempts(id);
     }
 
-    /** Cancel a PENDING job. 404 if unknown, 409 if it is no longer PENDING. */
+    /**
+     * Cancel a job. PENDING: cancelled immediately (200). RUNNING: cancellation is requested and the worker stops
+     * the job at its next heartbeat (202, the job still shows RUNNING with cancelRequested = true).
+     * 404 if unknown, 409 if the job already finished.
+     */
     @DeleteMapping("/{id}")
-    public Job cancel(@PathVariable UUID id) {
-        return service.cancel(id);
+    public ResponseEntity<Job> cancel(@PathVariable UUID id) {
+        JobService.CancelResult result = service.cancel(id);
+        return result.immediate()
+                ? ResponseEntity.ok(result.job())
+                : ResponseEntity.accepted().body(result.job());
     }
 
     /** Re-queue a DEAD job. 404 if unknown, 409 if it is not DEAD. */

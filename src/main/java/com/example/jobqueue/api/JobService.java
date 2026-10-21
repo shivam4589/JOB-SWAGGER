@@ -43,6 +43,10 @@ public class JobService {
     public record SubmitResult(Job job, boolean created) {
     }
 
+    /** immediate = the job was waiting and is cancelled now; otherwise cancellation was requested from its worker. */
+    public record CancelResult(Job job, boolean immediate) {
+    }
+
     public SubmitResult submit(SubmitJobRequest req, String idempotencyKey) {
         int priority = req.priority() != null ? req.priority() : DEFAULT_PRIORITY;
         int delaySeconds = req.delaySeconds() != null ? req.delaySeconds() : 0;
@@ -87,10 +91,20 @@ public class JobService {
         return repository.attemptsFor(id);
     }
 
-    /** Only PENDING jobs can be cancelled; a job a worker already claimed is left alone. */
-    public Job cancel(UUID id) {
-        return repository.cancelIfPending(id)
-                .orElseThrow(() -> notFoundOrConflict(id, "cancelled", "PENDING"));
+    /**
+     * A waiting (PENDING) job is cancelled at once. A RUNNING job is flagged, and its worker stops it at the next
+     * heartbeat (cooperative cancellation). Finished jobs cannot be cancelled.
+     */
+    public CancelResult cancel(UUID id) {
+        Optional<Job> cancelled = repository.cancelIfPending(id);
+        if (cancelled.isPresent()) {
+            return new CancelResult(cancelled.get(), true);
+        }
+        Optional<Job> requested = repository.requestCancelIfRunning(id);
+        if (requested.isPresent()) {
+            return new CancelResult(requested.get(), false);
+        }
+        throw notFoundOrConflict(id, "cancelled", "PENDING or RUNNING");
     }
 
     /** Puts a DEAD job back in the queue with a fresh attempt budget. Its attempt history is kept. */

@@ -43,6 +43,8 @@ services:
       # Short timeout so the crash-recovery demo is quick. In real use it must exceed your slowest job.
       JOBQUEUE_WORKER_LOCK_TIMEOUT_SECONDS: "30"
       JOBQUEUE_WORKER_REAPER_INTERVAL_MS: "5000"
+      # also how quickly a cancel request reaches a running job
+      JOBQUEUE_WORKER_HEARTBEAT_INTERVAL_MS: "3000"
       # 4 worker threads + reaper + scheduler need few connections; keeps 6+ containers under Postgres' 100-connection limit
       SPRING_DATASOURCE_HIKARI_MAXIMUM_POOL_SIZE: "6"
 

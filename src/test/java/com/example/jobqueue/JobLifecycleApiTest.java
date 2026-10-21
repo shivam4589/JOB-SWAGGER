@@ -75,11 +75,23 @@ class JobLifecycleApiTest {
     }
 
     @Test
-    void runningJobCannotBeCancelled() throws Exception {
+    void cancellingARunningJobIsAcceptedAndFlagged() throws Exception {
         String id = submit("T");
         repository.claimNext("w1").orElseThrow();
 
-        mvc.perform(delete("/api/jobs/" + id)).andExpect(status().isConflict());
+        mvc.perform(delete("/api/jobs/" + id))
+                .andExpect(status().isAccepted())
+                .andExpect(jsonPath("$.status").value("RUNNING"))
+                .andExpect(jsonPath("$.cancelRequested").value(true));
+    }
+
+    @Test
+    void aFinishedJobCannotBeCancelled() throws Exception {
+        Job job = repository.insert(UUID.randomUUID(), "T", mapper.createObjectNode(), 5, 0, 1);
+        repository.claimNext("w1").orElseThrow();
+        repository.markDead(job.id(), "w1", "gave up");
+
+        mvc.perform(delete("/api/jobs/" + job.id())).andExpect(status().isConflict());
     }
 
     @Test
